@@ -9,7 +9,7 @@ rel/example_project
 .concrete/DEV_MODE
 .rebar
 .erlang.mk/
-pulsar.d
+rocketmq.d
 data/
 cover/
 ct.coverdata

@@ -37,16 +37,16 @@ start() ->
     application:start(rocketmq).
 
 ensure_supervised_client(ClientId, Hosts, Opts) ->
-    pulsar_client_sup:ensure_present(ClientId, Hosts, Opts).
+    rocketmq_client_sup:ensure_present(ClientId, Hosts, Opts).
 
 stop_and_delete_supervised_client(ClientId) ->
-    pulsar_client_sup:ensure_absence(ClientId).
+    rocketmq_client_sup:ensure_absence(ClientId).
 
 ensure_supervised_producers(ClientId, Topic, Opts) ->
-    pulsar_producers:start_supervised(ClientId, Topic, Opts).
+    rocketmq_producers:start_supervised(ClientId, Topic, Opts).
 
 stop_and_delete_supervised_producers(Producers) ->
-    pulsar_producers:stop_supervised(Producers).
+    rocketmq_producers:stop_supervised(Producers).
 
 send(_Producers, _Batch) ->
     ok.
