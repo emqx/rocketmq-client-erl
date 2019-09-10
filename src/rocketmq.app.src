@@ -3,5 +3,5 @@
               {vsn,"git"},
               {modules,[]},
               {registered,[rocketmq_sup]},
-              {applications,[kernel,stdlib]},
+              {applications,[kernel,stdlib,jsonr]},
               {mod,{rocketmq_app,[]}}]}.
