@@ -105,7 +105,7 @@ connected(_EventType, {tcp_closed, Sock}, State = #state{sock = Sock}) ->
     {next_state, idle, State#state{sock = undefined}};
 
 connected(_EventType, {tcp, _, Bin}, State) ->
-    handle_response(rocketmq_protocol_frame:parse(Bin), State);
+    handle_response(Bin, State);
 
 connected({call, From}, {send, Message}, State = #state{sock = Sock,
                                                         topic = Topic,
@@ -113,15 +113,22 @@ connected({call, From}, {send, Message}, State = #state{sock = Sock,
                                                         producer_group = ProducerGroup,
                                                         opaque_id = Opaque,
                                                         requests = Reqs}) ->
-    send(Sock, ProducerGroup, Topic, Opaque, QueueId, Message),
+    send(Sock, ProducerGroup, Topic, Opaque, QueueId, {Message, <<>>}),
     {keep_state, next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)})};
 
 connected(cast, {send, Message}, State = #state{sock = Sock,
                                                 topic = Topic,
                                                 queue_id = QueueId,
                                                 producer_group = ProducerGroup,
-                                                opaque_id = Opaque}) ->
-    send(Sock, ProducerGroup, Topic, Opaque, QueueId, Message),
+                                                opaque_id = Opaque,
+                                                batch_size = BatchSize}) ->
+    case BatchSize =:= 0 of
+        true ->
+            send(Sock, ProducerGroup, Topic, Opaque, QueueId, {Message, <<>>});
+        false ->
+            Messages = [{Message, <<>>} | collect_send_calls(BatchSize)],
+            batch_send(Sock, ProducerGroup, Topic, Opaque, QueueId, Messages)
+    end,
     {keep_state, next_opaque_id(State)};
 
 
@@ -140,25 +147,27 @@ code_change(_Vsn, State, Data, _Extra) ->
 terminate(_Reason, _StateName, _State) ->
     ok.
 
-handle_response({Header, _}, State = #state{requests = Reqs, callback = undefined}) ->
-    {ok, Opaque} = maps:find(<<"opaque">>, Header),
-    case maps:get(Opaque, Reqs, undefined) of
-        undefined ->
-            {keep_state, State};
-        From ->
-            gen_statem:reply(From, maps:get(<<"code">>, Header, undefined)),
-            {keep_state, State#state{requests = maps:remove(Opaque, Reqs)}}
-    end;
 
-handle_response({Header, _}, State = #state{requests = Reqs, callback = Callback, topic = Topic}) ->
+handle_response(<<>>, State) ->
+    {keep_state, State};
+
+handle_response(Bin, State = #state{requests = Reqs, callback = Callback, topic = Topic}) ->
+    {Header, _, Bin1} = rocketmq_protocol_frame:parse(Bin),
+    NewReqs = do_response(Header, Reqs, Callback, Topic),
+    handle_response(Bin1, State#state{requests = NewReqs}).
+
+do_response(Header, Reqs, Callback, Topic) ->
     {ok, Opaque} = maps:find(<<"opaque">>, Header),
     case maps:get(Opaque, Reqs, undefined) of
         undefined ->
-            Callback(maps:get(<<"code">>, Header, undefined), Topic),
-            {keep_state, State};
+            case Callback =:= undefined of
+                true  -> ok;
+                false -> Callback(maps:get(<<"code">>, Header, undefined), Topic)
+            end,
+            Reqs;
         From ->
             gen_statem:reply(From, maps:get(<<"code">>, Header, undefined)),
-            {keep_state, State#state{requests = maps:remove(Opaque, Reqs)}}
+            maps:remove(Opaque, Reqs)
     end.
 
 start_keepalive() ->
@@ -175,6 +184,28 @@ ping(Sock, ProducerGroup, Opaque) ->
 send(Sock, ProducerGroup, Topic, Opaque, QueueId, Message) ->
     Package = rocketmq_protocol_frame:send_message_v2(Opaque, ProducerGroup, Topic, QueueId, Message),
     gen_tcp:send(Sock, Package).
+
+batch_send(Sock, ProducerGroup, Topic, Opaque, QueueId, Messages) ->
+    Package = rocketmq_protocol_frame:send_batch_message_v2(Opaque, ProducerGroup, Topic, QueueId, Messages),
+    gen_tcp:send(Sock, Package).
+
+
+collect_send_calls(0) ->
+    [];
+collect_send_calls(Cnt) when Cnt > 0 ->
+    collect_send_calls(Cnt, []).
+
+collect_send_calls(0, Acc) ->
+    lists:reverse(Acc);
+
+collect_send_calls(Cnt, Acc) ->
+    receive
+        {'$gen_cast', {send, Message}} ->
+            collect_send_calls(Cnt - 1,  [{Message, <<>>} | Acc])
+    after 0 ->
+          lists:reverse(Acc)
+    end.
+
 
 tune_buffer(Sock) ->
     {ok, [{recbuf, RecBuf}, {sndbuf, SndBuf}]} = inet:getopts(Sock, [recbuf, sndbuf]),

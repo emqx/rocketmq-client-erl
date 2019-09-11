@@ -73,7 +73,7 @@ handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = Op
         Sock1 ->
             Package = rocketmq_protocol_frame:get_routeinfo_by_topic(OpaqueId, Topic),
             gen_tcp:send(Sock1, Package),
-            {noreply, State#state{requests = maps:put(OpaqueId, From, Reqs), sock = Sock1}}
+            {noreply, next_opaque_id(State#state{requests = maps:put(OpaqueId, From, Reqs), sock = Sock1})}
     end;
 
 handle_call(_Req, _From, State) ->
@@ -98,15 +98,22 @@ terminate(_Reason, #state{}) ->
 code_change(_, State, _) ->
     {ok, State}.
 
+handle_response(<<>>, State) ->
+    {noreply, State, hibernate};
+
 handle_response(Bin, State = #state{requests = Reqs}) ->
-    {Header, Payload} = rocketmq_protocol_frame:parse(Bin),
+    {Header, Payload, Bin1} = rocketmq_protocol_frame:parse(Bin),
+    NewReqs = do_response(Header, Payload, Reqs),
+    handle_response(Bin1, State#state{requests = NewReqs}).
+
+do_response(Header, Payload, Reqs) ->
     OpaqueId = maps:get(<<"opaque">>, Header, 1),
     case maps:get(OpaqueId, Reqs, undefined) of
         undefined ->
-            {noreply, next_opaque_id(State), hibernate};
+            Reqs;
         From ->
             gen_server:reply(From, {Header, Payload}),
-            {noreply, next_opaque_id(State#state{requests = maps:remove(OpaqueId, Reqs)}), hibernate}
+            maps:remove(OpaqueId, Reqs)
     end.
 
 tune_buffer(Sock) ->
