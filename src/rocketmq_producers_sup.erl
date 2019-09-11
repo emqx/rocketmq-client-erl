@@ -20,7 +20,7 @@
 
 -export([start_link/0, init/1]).
 
--export([ensure_present/3, ensure_absence/2]).
+-export([ensure_present/4, ensure_absence/2]).
 
 -define(SUPERVISOR, ?MODULE).
 -define(WORKER_ID(ClientId, Topic), {ClientId, Topic}).
@@ -37,8 +37,8 @@ init([]) ->
     {ok, {SupFlags, Children}}.
 
 %% ensure a client started under supervisor
-ensure_present(ClientId, Topic, ProducerOpts) ->
-    ChildSpec = child_spec(ClientId, Topic, ProducerOpts),
+ensure_present(ClientId, ProducerGroup, Topic, ProducerOpts) ->
+    ChildSpec = child_spec(ClientId, ProducerGroup, Topic, ProducerOpts),
     case supervisor:start_child(?SUPERVISOR, ChildSpec) of
         {ok, Pid} -> {ok, Pid};
         {error, {already_started, Pid}} -> {ok, Pid};
@@ -53,9 +53,9 @@ ensure_absence(ClientId, Topic) ->
         {error, not_found} -> ok
     end.
 
-child_spec(ClientId, Topic, ProducerOpts) ->
+child_spec(ClientId, ProducerGroup, Topic, ProducerOpts) ->
     #{id => ?WORKER_ID(ClientId, Topic),
-        start => {rocketmq_producers, start_link, [ClientId, Topic, ProducerOpts]},
+        start => {rocketmq_producers, start_link, [ClientId, ProducerGroup, Topic, ProducerOpts]},
         restart => transient,
         type => worker,
         modules => [rocketmq_producer]
