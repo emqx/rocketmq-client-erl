@@ -169,18 +169,22 @@ handle_info(ref_topic_route, State = #state{client_id = ClientId,
     case rocketmq_client_sup:find_client(ClientId) of
         {ok, Pid} ->
             erlang:send_after(RefTopicRouteInterval, self(), ref_topic_route),
-            {_, Payload} = rocketmq_client:get_routeinfo_by_topic(Pid, Topic),
-            BrokerDatas1 = lists:sort(maps:get(<<"brokerDatas">>, Payload, [])),
-            case BrokerDatas1 -- lists:sort(BrokerDatas) of
-                [] -> {noreply, State};
-                BrokerDatas2 ->
-                    QueueDatas = maps:get(<<"queueDatas">>, Payload, []),
-                    {NewQueueNums, NewProducers} = start_producer(QueueNums, BrokerDatas2, QueueDatas, Producers, State),
-                    ets:insert(rocketmq_topic, {Topic, NewQueueNums}),
-                    {noreply, State#state{queue_nums = NewQueueNums,
-                                          producers = NewProducers,
-                                          broker_datas = BrokerDatas1}}
-            end;
+            case rocketmq_client:get_routeinfo_by_topic(Pid, Topic) of
+                {_, undefined} ->
+                    {noreply, State};
+                {_, Payload} ->
+                    BrokerDatas1 = lists:sort(maps:get(<<"brokerDatas">>, Payload, [])),
+                    case BrokerDatas1 -- lists:sort(BrokerDatas) of
+                        [] -> {noreply, State};
+                        BrokerDatas2 ->
+                            QueueDatas = maps:get(<<"queueDatas">>, Payload, []),
+                            {NewQueueNums, NewProducers} = start_producer(QueueNums, BrokerDatas2, QueueDatas, Producers, State),
+                            ets:insert(rocketmq_topic, {Topic, NewQueueNums}),
+                            {noreply, State#state{queue_nums = NewQueueNums,
+                                                producers = NewProducers,
+                                                broker_datas = BrokerDatas1}}
+                    end
+                end;
         {error, Reason} ->
             {stop, Reason, State}
     end;
