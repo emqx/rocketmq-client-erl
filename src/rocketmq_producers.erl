@@ -39,7 +39,9 @@
                 queue_nums,
                 producer_opts,
                 producers = #{},
-                producer_group}).
+                producer_group,
+                broker_datas,
+                ref_topic_route_interval = 5000}).
 
 start_supervised(ClientId, ProducerGroup, Topic, ProducerOpts) ->
   {ok, Pid} = rocketmq_producers_sup:ensure_present(ClientId, ProducerGroup, Topic, ProducerOpts),
@@ -53,9 +55,13 @@ start_supervised(ClientId, ProducerGroup, Topic, ProducerOpts) ->
 stop_supervised(#{client := ClientId, topic := Topic}) ->
   rocketmq_producers_sup:ensure_absence(ClientId, Topic).
 
-pick_producer(#{workers := Workers, queue_nums := QueueNums}) ->
-    QueueNum = pick_queue_num(QueueNums),
-    do_pick_producer(QueueNum, QueueNums, Workers).
+pick_producer(#{workers := Workers, queue_nums := QueueNums0, topic := Topic}) ->
+    QueueNums1 =  case ets:lookup(rocketmq_topic, Topic) of
+        [] -> QueueNums0;
+        [{_, QueueNums}] -> QueueNums
+    end,
+    QueueNum = pick_queue_num(QueueNums1),
+    do_pick_producer(QueueNum, QueueNums1, Workers).
 
 do_pick_producer(QueueNum, QueueNums, Workers) ->
     Pid = lookup_producer(Workers, QueueNum),
@@ -74,10 +80,14 @@ pick_next_alive(Workers, QueueNum, QueueNums) ->
 pick_next_alive(_Workers, _QueueNum, QueueNums, QueueNums) ->
     erlang:error(all_producers_down);
 pick_next_alive(Workers, QueueNum, QueueNums, Tried) ->
-    Pid = lookup_producer(Workers, QueueNum),
-    case is_alive(Pid) of
-        true -> {QueueNum, Pid};
-        false -> pick_next_alive(Workers, (QueueNum + 1) rem QueueNums, QueueNums, Tried + 1)
+    case lookup_producer(Workers, QueueNum) of
+        {error, _} ->
+            pick_next_alive(Workers, (QueueNum + 1) rem QueueNums, QueueNums, Tried + 1);
+        Pid ->
+            case is_alive(Pid) of
+                true -> {QueueNum, Pid};
+                false -> pick_next_alive(Workers, (QueueNum + 1) rem QueueNums, QueueNums, Tried + 1)
+            end
     end.
 
 is_alive(Pid) -> is_pid(Pid) andalso is_process_alive(Pid).
@@ -87,8 +97,10 @@ lookup_producer(#{workers := Workers}, QueueNum) ->
 lookup_producer(Workers, QueueNum) when is_map(Workers) ->
     maps:get(QueueNum, Workers);
 lookup_producer(Workers, QueueNum) ->
-    [{QueueNum, Pid}] = ets:lookup(Workers, QueueNum),
-    Pid.
+    case ets:lookup(Workers, QueueNum) of
+        [] -> {error, get_worker_fail};
+        [{QueueNum, Pid}] -> Pid
+    end.
 
 pick_queue_num(QueueNums) ->
     QueueNum = case get(rocketmq_roundrobin) of
@@ -103,10 +115,13 @@ start_link(ClientId, ProducerGroup, Topic, ProducerOpts) ->
 
 init([ClientId, ProducerGroup, Topic, ProducerOpts]) ->
     erlang:process_flag(trap_exit, true),
+    RefTopicRouteInterval = maps:get(ref_topic_route_interval, ProducerOpts, 5000),
+    erlang:send_after(RefTopicRouteInterval, self(), ref_topic_route),
     {ok, #state{topic = Topic,
                 client_id = ClientId,
                 producer_opts = ProducerOpts,
                 producer_group = ProducerGroup,
+                ref_topic_route_interval = RefTopicRouteInterval,
                 workers = ets:new(get_name(Topic), [protected, named_table])}, 0}.
 
 handle_call(get_workers, _From, State = #state{workers = Workers, queue_nums = QueueNum}) ->
@@ -122,8 +137,10 @@ handle_info(timeout, State = #state{client_id = ClientId, topic = Topic}) ->
     case rocketmq_client_sup:find_client(ClientId) of
         {ok, Pid} ->
             Result = rocketmq_client:get_routeinfo_by_topic(Pid, Topic),
-            {QueueNums, NewProducers} = maybe_start_producer(Pid, Result, State),
-            {noreply, State#state{queue_nums = QueueNums, producers = NewProducers}};
+            {QueueNums, NewProducers, BrokerDatas} = maybe_start_producer(Pid, Result, State),
+            {noreply, State#state{queue_nums = QueueNums,
+                                  producers = NewProducers,
+                                  broker_datas = BrokerDatas}};
         {error, Reason} ->
             {stop, Reason, State}
     end;
@@ -140,8 +157,33 @@ handle_info({'EXIT', Pid, _Error}, State = #state{workers = Workers, producers =
     end;
 
 handle_info({start_producer, BrokerAddrs, QueueSeq}, State = #state{producers = Producers}) ->
-    NewProducers = start_producer(BrokerAddrs, QueueSeq, Producers, State),
+    NewProducers = do_start_producer(BrokerAddrs, QueueSeq, Producers, State),
     {noreply, State#state{producers = NewProducers}};
+
+handle_info(ref_topic_route, State = #state{client_id = ClientId,
+                                            topic = Topic,
+                                            queue_nums = QueueNums,
+                                            broker_datas = BrokerDatas,
+                                            producers = Producers,
+                                            ref_topic_route_interval = RefTopicRouteInterval}) ->
+    case rocketmq_client_sup:find_client(ClientId) of
+        {ok, Pid} ->
+            erlang:send_after(RefTopicRouteInterval, self(), ref_topic_route),
+            {_, Payload} = rocketmq_client:get_routeinfo_by_topic(Pid, Topic),
+            BrokerDatas1 = lists:sort(maps:get(<<"brokerDatas">>, Payload, [])),
+            case BrokerDatas1 -- lists:sort(BrokerDatas) of
+                [] -> {noreply, State};
+                BrokerDatas2 ->
+                    QueueDatas = maps:get(<<"queueDatas">>, Payload, []),
+                    {NewQueueNums, NewProducers} = start_producer(QueueNums, BrokerDatas2, QueueDatas, Producers, State),
+                    ets:insert(rocketmq_topic, {Topic, NewQueueNums}),
+                    {noreply, State#state{queue_nums = NewQueueNums,
+                                          producers = NewProducers,
+                                          broker_datas = BrokerDatas1}}
+            end;
+        {error, Reason} ->
+            {stop, Reason, State}
+    end;
 
 handle_info(_Info, State) ->
     log_error("Receive unknown message:~p~n", [_Info]),
@@ -163,9 +205,22 @@ maybe_start_producer(Pid, {Header, undefined}, State = #state{topic = Topic}) ->
     Result = rocketmq_client:get_routeinfo_by_topic(Pid, <<"TBW102">>),
     maybe_start_producer(Pid, Result, State);
 
-maybe_start_producer(_, {_, Payload}, State = #state{topic = Topic,producers = Producers}) ->
+maybe_start_producer(_, {_, Payload}, State = #state{producers = Producers}) ->
     BrokerDatas = maps:get(<<"brokerDatas">>, Payload, []),
     QueueDatas = maps:get(<<"queueDatas">>, Payload, []),
+    {QueueNums, NewProducers} = start_producer(0, BrokerDatas, QueueDatas, Producers, State),
+    {QueueNums, NewProducers, BrokerDatas}.
+
+find_queue_data(_Key, []) ->
+    [];
+find_queue_data(Key, [QueueData | QueueDatas]) ->
+    BrokerName = maps:get(<<"brokerName">>, QueueData),
+    case BrokerName =:= Key of
+        true -> QueueData;
+        false -> find_queue_data(Key, QueueDatas)
+    end.
+
+start_producer(Start, BrokerDatas,  QueueDatas, Producers, State = #state{topic = Topic}) ->
     lists:foldl(fun(BrokerData, {QueueNumAcc, ProducersAcc}) ->
         BrokerAddrs = maps:get(<<"brokerAddrs">>, BrokerData),
         BrokerName = maps:get(<<"brokerName">>, BrokerData),
@@ -178,22 +233,13 @@ maybe_start_producer(_, {_, Payload}, State = #state{topic = Topic,producers = P
                 QueueNum = maps:get(<<"writeQueueNums">>, QueueData),
                 QueueNumAcc1 = QueueNumAcc + QueueNum,
                 ProducersAcc1 = lists:foldl(fun(QueueSeq, Acc) ->
-                    start_producer(BrokerAddrs, QueueSeq, Acc, State)
-                end, ProducersAcc, lists:seq(QueueNumAcc, QueueNumAcc1)),
+                    do_start_producer(BrokerAddrs, QueueSeq, Acc, State)
+                end, ProducersAcc, lists:seq(QueueNumAcc, QueueNumAcc1 -1)),
                 {QueueNumAcc1, ProducersAcc1}
         end
-    end, {0, Producers}, BrokerDatas).
+    end, {Start, Producers}, BrokerDatas).
 
-find_queue_data(_Key, []) ->
-    [];
-find_queue_data(Key, [QueueData | QueueDatas]) ->
-    BrokerName = maps:get(<<"brokerName">>, QueueData),
-    case BrokerName =:= Key of
-        true -> QueueData;
-        false -> find_queue_data(Key, QueueDatas)
-    end.
-
-start_producer(BrokerAddrs, QueueSeq, Producers, #state{workers = Workers,
+do_start_producer(BrokerAddrs, QueueSeq, Producers, #state{workers = Workers,
                                                         topic = Topic,
                                                         producer_group = ProducerGroup,
                                                         producer_opts = ProducerOpts}) ->
