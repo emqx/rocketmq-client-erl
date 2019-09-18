@@ -29,6 +29,7 @@ start_link() ->
     supervisor:start_link({local, ?SUPERVISOR}, ?MODULE, []).
 
 init([]) ->
+    ets:new(rocketmq_topic, [public, named_table]),
     SupFlags = #{strategy => one_for_one,
                  intensity => 10,
                  period => 5
