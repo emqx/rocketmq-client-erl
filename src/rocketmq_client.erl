@@ -22,6 +22,8 @@
 
 -export([get_routeinfo_by_topic/2]).
 
+-export([get_status/1]).
+
 %% gen_server Callbacks
 -export([ init/1
         , handle_call/3
@@ -50,6 +52,9 @@ start_link(ClientId, Servers, Opts) ->
 get_routeinfo_by_topic(Pid, Topic) ->
     gen_server:call(Pid, {get_routeinfo_by_topic, Topic}).
 
+get_status(Pid) ->
+    gen_server:call(Pid, get_status, 5000).
+
 %%--------------------------------------------------------------------
 %% gen_server callback
 %%--------------------------------------------------------------------
@@ -75,6 +80,14 @@ handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = Op
             gen_tcp:send(Sock1, Package),
             {noreply, next_opaque_id(State#state{requests = maps:put(OpaqueId, From, Reqs), sock = Sock1})}
     end;
+
+handle_call(get_status, _From, State = #state{sock = undefined, servers = Servers}) ->
+    case get_sock(Servers, undefined) of
+        error -> {reply, false, State};
+        Sock -> {reply, true, State#state{sock = Sock}}
+    end;
+handle_call(get_status, _From, State) ->
+    {reply, true, State};
 
 handle_call(_Req, _From, State) ->
     {reply, ok, State, hibernate}.
