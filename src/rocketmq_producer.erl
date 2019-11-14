@@ -56,7 +56,8 @@ callback_mode() -> [state_functions].
                 opts = [],
                 callback,
                 batch_size = 0,
-                requests = #{}}).
+                requests = #{},
+                last_bin = <<>>}).
 
 start_link(QueueId, Topic, Server, ProducerGroup, ProducerOpts) ->
     gen_statem:start_link(?MODULE, [QueueId, Topic, Server, ProducerGroup, ProducerOpts], []).
@@ -151,10 +152,17 @@ terminate(_Reason, _StateName, _State) ->
 handle_response(<<>>, State) ->
     {keep_state, State};
 
-handle_response(Bin, State = #state{requests = Reqs, callback = Callback, topic = Topic}) ->
-    {Header, _, Bin1} = rocketmq_protocol_frame:parse(Bin),
-    NewReqs = do_response(Header, Reqs, Callback, Topic),
-    handle_response(Bin1, State#state{requests = NewReqs}).
+handle_response(Bin, State = #state{requests = Reqs,
+                                    callback = Callback,
+                                    topic = Topic,
+                                    last_bin = LastBin}) ->
+    case rocketmq_protocol_frame:parse(<<LastBin/binary, Bin/binary>>) of
+        {undefined, undefined, Bin1} ->
+            {keep_state, State#state{last_bin = Bin1}};
+        {Header, _, Bin1} ->
+            NewReqs = do_response(Header, Reqs, Callback, Topic),
+            handle_response(Bin1, State#state{requests = NewReqs, last_bin = <<>>})
+    end.
 
 do_response(Header, Reqs, Callback, Topic) ->
     {ok, Opaque} = maps:find(<<"opaque">>, Header),
