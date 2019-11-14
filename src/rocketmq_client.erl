@@ -33,7 +33,7 @@
         , code_change/3
         ]).
 
--record(state, {requests, opaque_id, sock, servers, opts}).
+-record(state, {requests, opaque_id, sock, servers, opts, last_bin = <<>>}).
 
 -define(TIMEOUT, 60000).
 
@@ -114,10 +114,14 @@ code_change(_, State, _) ->
 handle_response(<<>>, State) ->
     {noreply, State, hibernate};
 
-handle_response(Bin, State = #state{requests = Reqs}) ->
-    {Header, Payload, Bin1} = rocketmq_protocol_frame:parse(Bin),
-    NewReqs = do_response(Header, Payload, Reqs),
-    handle_response(Bin1, State#state{requests = NewReqs}).
+handle_response(Bin, State = #state{requests = Reqs, last_bin = LastBin}) ->
+    case rocketmq_protocol_frame:parse(<<LastBin/binary, Bin/binary>>) of
+        {undefined, undefined, Bin1} ->
+            {nodelay, State#state{last_bin = Bin1}, hibernate};
+        {Header, Payload, Bin1} ->
+            NewReqs = do_response(Header, Payload, Reqs),
+            handle_response(Bin1, State#state{requests = NewReqs, last_bin = <<>>})
+        end.
 
 do_response(Header, Payload, Reqs) ->
     OpaqueId = maps:get(<<"opaque">>, Header, 1),

@@ -59,18 +59,24 @@ heart_beat(Opaque, ClientID, GroupName) ->
                                         [{<<"groupName">>, <<"CLIENT_INNER_PRODUCER">>}]]}],
     serialized(?HEART_BEAT, Opaque, jsonr:encode(Payload)).
 
-parse(<<Len:32, HeaderLen:32, HeaderData:HeaderLen/binary, Bin/binary>>) ->
-    case Bin == <<>> of
+parse(<<Len:32, HeaderLen:32, RestBin/binary>> = Bin0) ->
+    case size(RestBin) > HeaderLen of
         true ->
-            {jsonr:decode(HeaderData), undefined, Bin};
+            <<HeaderData:HeaderLen/binary, Bin/binary>> = RestBin,
+            case Bin == <<>> of
+            true ->
+                {jsonr:decode(HeaderData), undefined, Bin};
+            false ->
+                case (Len - 4) - HeaderLen of
+                    0 ->
+                        {jsonr:decode(HeaderData), undefined, Bin};
+                    PayloadLen ->
+                        <<Payload:PayloadLen/binary, Bin1/binary>> = Bin,
+                        {jsonr:decode(HeaderData), jsonr:decode(Payload), Bin1}
+                end
+        end;
         false ->
-            case (Len - 4) - HeaderLen of
-                0 ->
-                    {jsonr:decode(HeaderData), undefined, Bin};
-                PayloadLen ->
-                    <<Payload:PayloadLen/binary, Bin1/binary>> = Bin,
-                    {jsonr:decode(HeaderData), jsonr:decode(Payload), Bin1}
-            end
+            {undefined, undefined, Bin0}
     end.
 
 batch_message(Payloads) ->
