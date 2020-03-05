@@ -52,8 +52,8 @@ start_supervised(ClientId, ProducerGroup, Topic, ProducerOpts) ->
          queue_nums => QueueNums
         }}.
 
-stop_supervised(#{client := ClientId, topic := Topic}) ->
-  rocketmq_producers_sup:ensure_absence(ClientId, Topic).
+stop_supervised(#{client := ClientId, workers := Workers}) ->
+  rocketmq_producers_sup:ensure_absence(ClientId, Workers).
 
 pick_producer(#{workers := Workers, queue_nums := QueueNums0, topic := Topic}) ->
     QueueNums1 =  case ets:lookup(rocketmq_topic, Topic) of
@@ -111,7 +111,7 @@ pick_queue_num(QueueNums) ->
     QueueNum.
 
 start_link(ClientId, ProducerGroup, Topic, ProducerOpts) ->
-    gen_server:start_link({local, get_name(Topic)}, ?MODULE, [ClientId, ProducerGroup, Topic, ProducerOpts], []).
+    gen_server:start_link({local, get_name(ProducerOpts)}, ?MODULE, [ClientId, ProducerGroup, Topic, ProducerOpts], []).
 
 init([ClientId, ProducerGroup, Topic, ProducerOpts]) ->
     erlang:process_flag(trap_exit, true),
@@ -122,7 +122,7 @@ init([ClientId, ProducerGroup, Topic, ProducerOpts]) ->
                 producer_opts = ProducerOpts,
                 producer_group = ProducerGroup,
                 ref_topic_route_interval = RefTopicRouteInterval,
-                workers = ets:new(get_name(Topic), [protected, named_table])}, 0}.
+                workers = ets:new(get_name(ProducerOpts), [protected, named_table])}, 0}.
 
 handle_call(get_workers, _From, State = #state{workers = Workers, queue_nums = QueueNum}) ->
     {reply, {QueueNum, Workers}, State};
@@ -198,8 +198,7 @@ code_change(_OldVsn, State, _Extra) ->
 
 terminate(_, _St) -> ok.
 
-get_name(Topic) ->
-    list_to_atom(lists:concat(["rocketmq_producers_", binary_to_list(Topic)])).
+get_name(ProducerOpts) -> maps:get(name, ProducerOpts, ?MODULE).
 
 log_error(Fmt, Args) ->
     error_logger:error_msg(Fmt, Args).

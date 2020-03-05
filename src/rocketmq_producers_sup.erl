@@ -23,7 +23,7 @@
 -export([ensure_present/4, ensure_absence/2]).
 
 -define(SUPERVISOR, ?MODULE).
--define(WORKER_ID(ClientId, Topic), {ClientId, Topic}).
+-define(WORKER_ID(ClientId, Name), {ClientId, Name}).
 
 start_link() ->
     supervisor:start_link({local, ?SUPERVISOR}, ?MODULE, []).
@@ -48,17 +48,19 @@ ensure_present(ClientId, ProducerGroup, Topic, ProducerOpts) ->
     end.
 
 %% ensure client stopped and deleted under supervisor
-ensure_absence(ClientId, Topic) ->
-    Id = ?WORKER_ID(ClientId, Topic),
+ensure_absence(ClientId, Name) ->
+    Id = ?WORKER_ID(ClientId, Name),
     case supervisor:terminate_child(?SUPERVISOR, Id) of
         ok -> ok = supervisor:delete_child(?SUPERVISOR, Id);
         {error, not_found} -> ok
     end.
 
 child_spec(ClientId, ProducerGroup, Topic, ProducerOpts) ->
-    #{id => ?WORKER_ID(ClientId, Topic),
+    #{id => ?WORKER_ID(ClientId, get_name(ProducerOpts)),
         start => {rocketmq_producers, start_link, [ClientId, ProducerGroup, Topic, ProducerOpts]},
         restart => transient,
         type => worker,
         modules => [rocketmq_producer]
     }.
+
+get_name(ProducerOpts) -> maps:get(name, ProducerOpts, rocketmq_producers).
