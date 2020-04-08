@@ -122,7 +122,7 @@ init([ClientId, ProducerGroup, Topic, ProducerOpts]) ->
                 producer_opts = ProducerOpts,
                 producer_group = ProducerGroup,
                 ref_topic_route_interval = RefTopicRouteInterval,
-                workers = ets:new(get_name(ProducerOpts), [protected, named_table])}, 0}.
+                workers = ets:new(get_name(ProducerOpts), [protected, named_table, {read_concurrency, true}])}, 0}.
 
 handle_call(get_workers, _From, State = #state{workers = Workers, queue_nums = QueueNum}) ->
     {reply, {QueueNum, Workers}, State};
