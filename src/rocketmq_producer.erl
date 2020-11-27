@@ -170,7 +170,11 @@ do_response(Header, Reqs, Callback, Topic) ->
         undefined ->
             case Callback =:= undefined of
                 true  -> ok;
-                false -> Callback(maps:get(<<"code">>, Header, undefined), Topic)
+                false ->
+                    case Callback of
+                        {M, F, A} -> erlang:apply(M, F, [maps:get(<<"code">>, Header, undefined), Topic] ++ A);
+                        _ -> Callback(maps:get(<<"code">>, Header, undefined), Topic)
+                    end
             end,
             Reqs;
         From ->
