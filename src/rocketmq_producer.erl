@@ -168,12 +168,16 @@ do_response(Header, Reqs, Callback, Topic) ->
     {ok, Opaque} = maps:find(<<"opaque">>, Header),
     case maps:get(Opaque, Reqs, undefined) of
         undefined ->
-            case Callback =:= undefined of
-                true  -> ok;
-                false ->
-                    case Callback of
-                        {M, F, A} -> erlang:apply(M, F, [maps:get(<<"code">>, Header, undefined), Topic] ++ A);
-                        _ -> Callback(maps:get(<<"code">>, Header, undefined), Topic)
+            case maps:get(<<"extFields">>, Header, undefined) of
+                undefined -> ok;
+                _ ->
+                    case Callback =:= undefined of
+                        true  -> ok;
+                        false ->
+                            case Callback of
+                                {M, F, A} -> erlang:apply(M, F, [maps:get(<<"code">>, Header, undefined), Topic] ++ A);
+                                _ -> Callback(maps:get(<<"code">>, Header, undefined), Topic)
+                            end
                     end
             end,
             Reqs;
