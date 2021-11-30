@@ -19,6 +19,7 @@
 -define(HEART_BEAT, 34).
 -define(GET_ROUTEINTO_BY_TOPIC, 105).
 -define(SEND_MESSAGE_V2, 310).
+-define(SEND_BATCH_MESSAGE, 320).
 
 -export([ get_routeinfo_by_topic/2
         , send_message_v2/5
@@ -33,7 +34,8 @@
 % 2 not read
 
 get_routeinfo_by_topic(Opaque, Topic) ->
-    serialized(?GET_ROUTEINTO_BY_TOPIC, Opaque, [{<<"extFields">>, [{<<"topic">>, Topic}]}], <<"">>).
+    serialized(?GET_ROUTEINTO_BY_TOPIC, Opaque,
+      [{<<"extFields">>, [{<<"topic">>, Topic}]}], <<"">>).
 
 % Header field is
 % ProducerGroup
@@ -47,10 +49,18 @@ send_message_v2(Opaque, ProducerGroup, Topic, QueueId, {Payload, Properties}) ->
               {<<"e">>, integer_to_binary(QueueId)},
               {<<"i">>, Properties},
               {<<"g">>, integer_to_binary(erlang:system_time(millisecond))}],
-    serialized(?SEND_MESSAGE_V2, Opaque, [{<<"extFields">>, Header ++ message_base()}], Payload).
+    serialized(?SEND_MESSAGE_V2, Opaque,
+      [{<<"extFields">>, Header ++ single_message_fixed_headers()}], Payload).
 
 send_batch_message_v2(Opaque, ProducerGroup, Topic, QueueId, Payloads) ->
-    send_message_v2(Opaque, ProducerGroup, Topic, QueueId, {batch_message(Payloads), <<>>}).
+  Header = [{<<"a">>, ProducerGroup},
+    {<<"b">>, Topic},
+    {<<"e">>, integer_to_binary(QueueId)},
+    {<<"i">>, <<>>},
+    {<<"g">>, integer_to_binary(erlang:system_time(millisecond))}],
+  I = batch_message(Payloads),
+  serialized(?SEND_BATCH_MESSAGE, Opaque,
+    [{<<"extFields">>, Header ++ batch_message_fixed_headers()}], I).
 
 heart_beat(Opaque, ClientID, GroupName) ->
     Payload = [{<<"clientID">>, ClientID},
@@ -84,10 +94,11 @@ batch_message([{Payload, Properties} | Payloads], Acc) ->
     MagicCode = 0,
     Crc = 0,
     PayloadLen = size(Payload),
-    Properties = <<>>,
+    Flag = 0,
     PropertiesLen = size(Properties),
-    Len = 10 + PayloadLen + size(Properties),
-    NewAcc = <<Acc/binary, Len:32, MagicCode:32, Crc:32, PayloadLen:32, Payload/binary, PropertiesLen:16>>,
+    Len = 18 + PayloadLen + size(Properties),
+    NewAcc = <<Acc/binary, Len:32, MagicCode:32, Crc:32, Flag:32,
+      PayloadLen:32, Payload/binary, PropertiesLen:16>>,
     batch_message(Payloads, NewAcc).
 
 serialized(Code, Opaque, Payload) ->
@@ -118,12 +129,17 @@ header_base() ->
 % String i;// properties;
 % Integer j;// reconsumeTimes;
 % boolean k;// unitMode = false;
-% boolean m;// ??;
-message_base() ->
+% boolean m;// batch message;
+
+single_message_fixed_headers() -> [{<<"m">>, <<"false">>} | message_fixed_headers()].
+
+batch_message_fixed_headers() -> [{<<"m">>, <<"true">>} | message_fixed_headers()].
+
+message_fixed_headers() ->
     [{<<"c">>, <<"TBW102">>},
      {<<"d">>, 8},
      {<<"f">>, 0},
      {<<"h">>, 0},
      {<<"j">>, 0},
-     {<<"k">>, <<"false">>},
-     {<<"m">>, <<"false">>}].
+     {<<"k">>, <<"false">>}
+    ].
