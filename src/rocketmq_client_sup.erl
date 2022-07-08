@@ -66,7 +66,7 @@ find_client(ClientId) ->
 child_spec(ClientId, Hosts, Opts) ->
     #{id => ClientId,
         start => {rocketmq_client, start_link, [ClientId, Hosts, Opts]},
-        restart => transient,
+        restart => permanent,
         type => worker,
         modules => [rocketmq_client]
     }.

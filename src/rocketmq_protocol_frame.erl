@@ -34,8 +34,8 @@
 % 2 not read
 
 get_routeinfo_by_topic(Opaque, Topic, ACLInfo) ->
-    serialized(?GET_ROUTEINTO_BY_TOPIC, Opaque,
-      [{<<"extFields">>, [{<<"topic">>, Topic}]}], <<"">>, ACLInfo).
+    Headers = [{<<"topic">>, Topic}],
+    serialized(?GET_ROUTEINTO_BY_TOPIC, Opaque, [], <<"">>, ACLInfo, Headers).
 
 % Header field is
 % ProducerGroup
@@ -49,7 +49,7 @@ send_message_v2(Opaque, ProducerGroup, Topic, QueueId, {Payload, Properties}, AC
                  {<<"e">>, integer_to_binary(QueueId)},
                  {<<"i">>, Properties},
                  {<<"g">>, integer_to_binary(erlang:system_time(millisecond))}
-                 | batch_message_fixed_headers()],
+                 | single_message_fixed_headers()],
     serialized(?SEND_MESSAGE_V2, Opaque, ExtFields, Payload, ACLInfo).
 
 send_batch_message_v2(Opaque, ProducerGroup, Topic, QueueId, Payloads, ACLInfo) ->
@@ -107,7 +107,23 @@ serialized(Code, Opaque, Payload) ->
 serialized(Code, Opaque, Payload, ACLInfo) ->
     serialized(Code, Opaque, [], Payload, ACLInfo).
 
-serialized(Code, Opaque, ExtFields0, Payload, ACLInfo = #{access_key := AK, secret_key := SK}) ->
+% serialized(Code, Opaque, ExtFields0, Payload, ACLInfo = #{access_key := AK, secret_key := SK}) ->
+%     ExtFields1 =
+%         case maps:get(security_token, ACLInfo, undefined) of
+%             Token when is_binary(Token) ->
+%                 [{<<"AccessKey">>, AK}, {<<"SecurityToken">>, Token} | ExtFields0];
+%             undefined ->
+%                 [{<<"AccessKey">>, AK} | ExtFields0]
+%         end,
+%     Signature = sign(SK, ExtFields1, Payload),
+%     ExtFields = [{<<"Signature">>, Signature} | ExtFields1],
+%     Headers = [{<<"extFields">>, ExtFields}],
+%     serialized_(Code, Opaque, Headers, Payload);
+
+serialized(Code, Opaque, ExtFields, Payload, ACLInfo) ->
+    serialized(Code, Opaque, ExtFields, Payload, ACLInfo, []).
+
+serialized(Code, Opaque, ExtFields0, Payload, ACLInfo = #{access_key := AK, secret_key := SK}, Headers) ->
     ExtFields1 =
         case maps:get(security_token, ACLInfo, undefined) of
             Token when is_binary(Token) ->
@@ -117,14 +133,15 @@ serialized(Code, Opaque, ExtFields0, Payload, ACLInfo = #{access_key := AK, secr
         end,
     Signature = sign(SK, ExtFields1, Payload),
     ExtFields = [{<<"Signature">>, Signature} | ExtFields1],
-    Headers = [{<<"extFields">>, ExtFields}],
-    serialized_(Code, Opaque, Headers, Payload);
+    AllHeaders = [{<<"extFields">>, ExtFields} | Headers],
+    serialized_(Code, Opaque, AllHeaders, Payload);
 
-serialized(Code, Opaque, ExtFields, Payload, _ACLInfo) ->
-    Headers = [{<<"extFields">>, ExtFields}],
-    serialized_(Code, Opaque, Header, Payload).
+serialized(Code, Opaque, ExtFields, Payload, _ACLInfo, Headers) ->
+    AllHeaders = [{<<"extFields">>, ExtFields} | Headers],
+    serialized_(Code, Opaque, AllHeaders, Payload).
 
 serialized_(Code, Opaque, Header0, Payload) ->
+    io:format("Header0 ~p~n", [Header0]),
     Header = [{<<"code">>, Code},
               {<<"opaque">>, Opaque}] ++ Header0 ++ header_base(),
     HeaderData = jsonr:encode(Header),
@@ -144,7 +161,7 @@ plist_to_binary([], Res) -> Res;
 plist_to_binary([{K, V} | List], Res) ->
     KBin = bin(K),
     VBin = bin(V),
-    plist_to_binary(List, <<K/binary, V/binary, Res>>).
+    plist_to_binary(List, <<KBin/binary, VBin/binary, Res/binary>>).
 
 
 bin(Bin) when is_binary(Bin) -> Bin;

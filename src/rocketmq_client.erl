@@ -78,7 +78,7 @@ handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = Op
             log_error("Servers: ~p down", [Servers]),
             {noreply, State};
         Sock1 ->
-            ACLInfo = maps:get(acl, Opts, undefined),
+            ACLInfo = maps:get(acl_info, Opts, #{}),
             Package = rocketmq_protocol_frame:get_routeinfo_by_topic(OpaqueId, Topic, ACLInfo),
             gen_tcp:send(Sock1, Package),
             {noreply, next_opaque_id(State#state{requests = maps:put(OpaqueId, From, Reqs), sock = Sock1})}
