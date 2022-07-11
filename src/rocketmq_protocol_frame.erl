@@ -21,9 +21,9 @@
 -define(SEND_MESSAGE_V2, 310).
 -define(SEND_BATCH_MESSAGE, 320).
 
--export([ get_routeinfo_by_topic/2
-        , send_message_v2/5
-        , send_batch_message_v2/5
+-export([ get_routeinfo_by_topic/3
+        , send_message_v2/6
+        , send_batch_message_v2/6
         , heart_beat/3
         ]).
 
@@ -33,9 +33,8 @@
 % 4 not write
 % 2 not read
 
-get_routeinfo_by_topic(Opaque, Topic) ->
-    serialized(?GET_ROUTEINTO_BY_TOPIC, Opaque,
-      [{<<"extFields">>, [{<<"topic">>, Topic}]}], <<"">>).
+get_routeinfo_by_topic(Opaque, Topic, ACLInfo) ->
+    serialized(?GET_ROUTEINTO_BY_TOPIC, Opaque, [{<<"topic">>, Topic}], <<"">>, ACLInfo).
 
 % Header field is
 % ProducerGroup
@@ -43,24 +42,24 @@ get_routeinfo_by_topic(Opaque, Topic) ->
 % QueueId
 % BornTimestamp
 % Properties
-send_message_v2(Opaque, ProducerGroup, Topic, QueueId, {Payload, Properties}) ->
-    Header = [{<<"a">>, ProducerGroup},
-              {<<"b">>, Topic},
-              {<<"e">>, integer_to_binary(QueueId)},
-              {<<"i">>, Properties},
-              {<<"g">>, integer_to_binary(erlang:system_time(millisecond))}],
-    serialized(?SEND_MESSAGE_V2, Opaque,
-      [{<<"extFields">>, Header ++ single_message_fixed_headers()}], Payload).
+send_message_v2(Opaque, ProducerGroup, Topic, QueueId, {Payload, Properties}, ACLInfo) ->
+    ExtFields = [{<<"a">>, ProducerGroup},
+                 {<<"b">>, Topic},
+                 {<<"e">>, integer_to_binary(QueueId)},
+                 {<<"i">>, Properties},
+                 {<<"g">>, integer_to_binary(erlang:system_time(millisecond))}
+                 | single_message_fixed_headers()],
+    serialized(?SEND_MESSAGE_V2, Opaque, ExtFields, Payload, ACLInfo).
 
-send_batch_message_v2(Opaque, ProducerGroup, Topic, QueueId, Payloads) ->
-  Header = [{<<"a">>, ProducerGroup},
-    {<<"b">>, Topic},
-    {<<"e">>, integer_to_binary(QueueId)},
-    {<<"i">>, <<>>},
-    {<<"g">>, integer_to_binary(erlang:system_time(millisecond))}],
-  I = batch_message(Payloads),
-  serialized(?SEND_BATCH_MESSAGE, Opaque,
-    [{<<"extFields">>, Header ++ batch_message_fixed_headers()}], I).
+send_batch_message_v2(Opaque, ProducerGroup, Topic, QueueId, Payloads, ACLInfo) ->
+    ExtFields = [{<<"a">>, ProducerGroup},
+                 {<<"b">>, Topic},
+                 {<<"e">>, integer_to_binary(QueueId)},
+                 {<<"i">>, <<>>},
+                 {<<"g">>, integer_to_binary(erlang:system_time(millisecond))}
+                 | batch_message_fixed_headers()],
+    I = batch_message(Payloads),
+    serialized(?SEND_BATCH_MESSAGE, Opaque, ExtFields, I, ACLInfo).
 
 heart_beat(Opaque, ClientID, GroupName) ->
     Payload = [{<<"clientID">>, ClientID},
@@ -102,9 +101,31 @@ batch_message([{Payload, Properties} | Payloads], Acc) ->
     batch_message(Payloads, NewAcc).
 
 serialized(Code, Opaque, Payload) ->
-    serialized(Code, Opaque, [], Payload).
+    serialized(Code, Opaque, Payload, #{}).
 
-serialized(Code, Opaque, Header0, Payload) ->
+serialized(Code, Opaque, Payload, ACLInfo) ->
+    serialized(Code, Opaque, [], Payload, ACLInfo).
+
+serialized(Code, Opaque, ExtFields0, Payload, ACLInfo = #{access_key := AK, secret_key := SK}) ->
+    ExtFields1 =
+        case maps:get(security_token, ACLInfo, undefined) of
+            Token when is_binary(Token) ->
+                [{<<"AccessKey">>, AK}, {<<"SecurityToken">>, Token} | ExtFields0];
+            undefined ->
+                [{<<"AccessKey">>, AK} | ExtFields0]
+        end,
+    %% must sort before sign.
+    ExtFields2 = lists:sort(ExtFields1),
+    Signature = sign(SK, ExtFields2, Payload),
+    ExtFields = lists:sort([{<<"Signature">>, Signature} | ExtFields2]),
+    Headers = [{<<"extFields">>, ExtFields}],
+    serialized_(Code, Opaque, Headers, Payload);
+
+serialized(Code, Opaque, ExtFields, Payload, _ACLInfo) ->
+    Headers = [{<<"extFields">>, ExtFields}],
+    serialized_(Code, Opaque, Headers, Payload).
+
+serialized_(Code, Opaque, Header0, Payload) ->
     Header = [{<<"code">>, Code},
               {<<"opaque">>, Opaque}] ++ Header0 ++ header_base(),
     HeaderData = jsonr:encode(Header),
@@ -112,9 +133,33 @@ serialized(Code, Opaque, Header0, Payload) ->
     Len = 4 + HeaderLen + size(Payload),
     <<Len:32, HeaderLen:32, HeaderData/binary, Payload/binary>>.
 
+sign(SK, ExtFields, Payload) ->
+    EFBin = plist_value_binary(ExtFields),
+    SignData = <<EFBin/binary, Payload/binary>>,
+    base64:encode(crypto:mac(hmac, sha, SK, SignData)).
+
+plist_value_binary(List) ->
+    plist_value_binary(lists:reverse(List), <<>>).
+
+plist_value_binary([], Res) -> Res;
+plist_value_binary([{_K, V} | List], Res) ->
+    VBin = bin(V),
+    plist_value_binary(List, <<VBin/binary, Res/binary>>).
+
+
+bin(Bin) when is_binary(Bin) -> Bin;
+bin(Num) when is_number(Num) -> number_to_binary(Num);
+bin(Atom) when is_atom(Atom) -> atom_to_binary(Atom, utf8);
+bin(List) when is_list(List) -> list_to_binary(List).
+
+number_to_binary(Int) when is_integer(Int) ->
+    integer_to_binary(Int);
+number_to_binary(Float) when is_float(Float) ->
+    float_to_binary(Float, [{decimals, 17}, compact]).
+
 header_base() ->
     [{<<"flag">>, 0},
-     {<<"language">>, <<"JAVA">>},
+     {<<"language">>, <<"ERLANG">>},
      {<<"serializeTypeCurrentRPC">>, <<"JSON">>},
      {<<"version">>, 315}].
 

@@ -70,13 +70,16 @@ init([Servers, Opts]) ->
 handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = OpaqueId,
                                                                   sock = Sock,
                                                                   requests = Reqs,
-                                                                  servers = Servers}) ->
+                                                                  servers = Servers,
+                                                                  opts = Opts
+                                                                  }) ->
     case get_sock(Servers, Sock) of
         error ->
             log_error("Servers: ~p down", [Servers]),
             {noreply, State};
         Sock1 ->
-            Package = rocketmq_protocol_frame:get_routeinfo_by_topic(OpaqueId, Topic),
+            ACLInfo = maps:get(acl_info, Opts, #{}),
+            Package = rocketmq_protocol_frame:get_routeinfo_by_topic(OpaqueId, Topic, ACLInfo),
             gen_tcp:send(Sock1, Package),
             {noreply, next_opaque_id(State#state{requests = maps:put(OpaqueId, From, Reqs), sock = Sock1})}
     end;

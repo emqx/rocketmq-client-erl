@@ -1,5 +1,12 @@
-{"0.3.4",
+{"0.4.0",
    [
+     {"0.3.4", [
+       {load_module, rocketmq_client, brutal_purge, soft_purge, []},
+       {load_module, rocketmq_client_sup, brutal_purge, soft_purge, []},
+       {load_module, rocketmq_client_producers, brutal_purge, soft_purge, []},
+       {load_module, rocketmq_client_producer, brutal_purge, soft_purge, []},
+       {load_module, rocketmq_protocol_frame, brutal_purge, soft_purge, []}
+     ]},
      {"0.3.3", [
        {load_module, rocketmq_protocol_frame, brutal_purge, soft_purge, []}
      ]},
@@ -13,6 +20,13 @@
      ]}
    ],
    [
+    {"0.3.4", [
+      {load_module, rocketmq_client, brutal_purge, soft_purge, []},
+      {load_module, rocketmq_client_sup, brutal_purge, soft_purge, []},
+      {load_module, rocketmq_client_producers, brutal_purge, soft_purge, []},
+      {load_module, rocketmq_client_producer, brutal_purge, soft_purge, []},
+      {load_module, rocketmq_protocol_frame, brutal_purge, soft_purge, []}
+     ]},
      {"0.3.3", [
       {load_module, rocketmq_protocol_frame, brutal_purge, soft_purge, []}
      ]},

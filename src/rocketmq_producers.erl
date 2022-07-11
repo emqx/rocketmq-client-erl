@@ -206,6 +206,7 @@ log_error(Fmt, Args) ->
 maybe_start_producer(Pid, {Header, undefined}, State = #state{topic = Topic}) ->
     log_error("Start topic:~p producer fail:~p", [Topic, maps:get(<<"remark">>, Header, undefined)]),
     Result = rocketmq_client:get_routeinfo_by_topic(Pid, <<"TBW102">>),
+    % erlang:error({start_producer_failed, Result});
     maybe_start_producer(Pid, Result, State);
 
 maybe_start_producer(_, {_, Payload}, State = #state{producers = Producers}) ->
