@@ -129,17 +129,22 @@ connected(cast, {send, Message}, State = #state{sock = Sock,
                                                 producer_group = ProducerGroup,
                                                 opaque_id = Opaque,
                                                 batch_size = BatchSize,
-                                                acl_info = ACLInfo
+                                                acl_info = ACLInfo,
+                                                requests = Requests
                                                 }) ->
-    case BatchSize =:= 0 of
-        true ->
-            send(Sock, ProducerGroup, Topic, Opaque, QueueId, {Message, <<>>}, ACLInfo);
-        false ->
-            Messages = [{Message, <<>>} | collect_send_calls(BatchSize)],
-            batch_send(Sock, ProducerGroup, Topic, Opaque, QueueId, Messages, ACLInfo)
-    end,
-    {keep_state, next_opaque_id(State)};
-
+    BatchLen =
+        case BatchSize =:= 0 of
+            true ->
+                _ = send(Sock, ProducerGroup, Topic, Opaque, QueueId, {Message, <<>>}, ACLInfo),
+                1;
+            false ->
+                Messages = [{Message, <<>>} | collect_send_calls(BatchSize)],
+                _ = batch_send(Sock, ProducerGroup, Topic, Opaque, QueueId, Messages, ACLInfo),
+                erlang:length(Messages)
+        end,
+    NRequests = maps:put(Opaque, {batch_len, BatchLen}, Requests),
+    NState = next_opaque_id(State),
+    {keep_state, NState#state{requests = NRequests}};
 
 connected(_EventType, ping, State = #state{sock = Sock,
                                            producer_group = ProducerGroup,
@@ -175,7 +180,7 @@ handle_response(Bin, State = #state{requests = Reqs,
 do_response(Header, Reqs, Callback, Topic) ->
     {ok, Opaque} = maps:find(<<"opaque">>, Header),
     case maps:get(Opaque, Reqs, undefined) of
-        undefined ->
+        {batch_len, Len} ->
             case maps:get(<<"extFields">>, Header, undefined) of
                 undefined -> ok;
                 _ ->
@@ -183,8 +188,10 @@ do_response(Header, Reqs, Callback, Topic) ->
                         true  -> ok;
                         false ->
                             case Callback of
-                                {M, F, A} -> erlang:apply(M, F, [maps:get(<<"code">>, Header, undefined), Topic] ++ A);
-                                _ -> Callback(maps:get(<<"code">>, Header, undefined), Topic)
+                                {M, F, A} ->
+                                    erlang:apply(M, F, [maps:get(<<"code">>, Header, undefined), Topic, Len] ++ A);
+                                Callback when is_function(Callback) ->
+                                    Callback(maps:get(<<"code">>, Header, undefined), Topic, Len)
                             end
                     end
             end,
