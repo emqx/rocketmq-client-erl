@@ -24,7 +24,7 @@
 -export([ get_routeinfo_by_topic/3
         , send_message_v2/6
         , send_batch_message_v2/6
-        , heart_beat/3
+        , heart_beat/4
         ]).
 
 -export([parse/1]).
@@ -61,12 +61,12 @@ send_batch_message_v2(Opaque, ProducerGroup, Topic, QueueId, Payloads, ACLInfo) 
     I = batch_message(Payloads),
     serialized(?SEND_BATCH_MESSAGE, Opaque, ExtFields, I, ACLInfo).
 
-heart_beat(Opaque, ClientID, GroupName) ->
+heart_beat(Opaque, ClientID, GroupName, ACLInfo) ->
     Payload = [{<<"clientID">>, ClientID},
                {<<"consumerDataSet">>, []},
                {<<"producerDataSet">>, [[{<<"groupName">>, GroupName}],
                                         [{<<"groupName">>, <<"CLIENT_INNER_PRODUCER">>}]]}],
-    serialized(?HEART_BEAT, Opaque, jsonr:encode(Payload)).
+    serialized(?HEART_BEAT, Opaque, jsonr:encode(Payload), ACLInfo).
 
 
 parse(<<Len:32, HeaderLen:32, HeaderData:HeaderLen/binary, Bin/binary>>) ->

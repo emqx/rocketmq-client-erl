@@ -148,8 +148,9 @@ connected(cast, {send, Message}, State = #state{sock = Sock,
 
 connected(_EventType, ping, State = #state{sock = Sock,
                                            producer_group = ProducerGroup,
-                                           opaque_id = Opaque}) ->
-    ping(Sock, ProducerGroup, Opaque),
+                                           opaque_id = Opaque,
+                                           acl_info = ACLInfo}) ->
+    ping(Sock, ProducerGroup, Opaque, ACLInfo),
     {keep_state, next_opaque_id(State)};
 
 connected(_EventType, EventContent, State) ->
@@ -196,6 +197,9 @@ do_response(Header, Reqs, Callback, Topic) ->
                     end
             end,
             Reqs;
+        undefined ->
+            %% ignore heart beat response
+            Reqs;
         From ->
             gen_statem:reply(From, maps:get(<<"code">>, Header, undefined)),
             maps:remove(Opaque, Reqs)
@@ -204,11 +208,11 @@ do_response(Header, Reqs, Callback, Topic) ->
 start_keepalive() ->
     erlang:send_after(30*1000, self(), ping).
 
-ping(Sock, ProducerGroup, Opaque) ->
+ping(Sock, ProducerGroup, Opaque, ACLInfo) ->
     {ok, {Host, Port}} = inet:sockname(Sock),
     Host1 = inet_parse:ntoa(Host),
     ClientId = list_to_binary(lists:concat([Host1, "@", Port])),
-    Package = rocketmq_protocol_frame:heart_beat(Opaque, ClientId, ProducerGroup),
+    Package = rocketmq_protocol_frame:heart_beat(Opaque, ClientId, ProducerGroup, ACLInfo),
     gen_tcp:send(Sock, Package),
     start_keepalive().
 
