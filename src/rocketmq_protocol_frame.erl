@@ -100,9 +100,6 @@ batch_message([{Payload, Properties} | Payloads], Acc) ->
       PayloadLen:32, Payload/binary, PropertiesLen:16>>,
     batch_message(Payloads, NewAcc).
 
-serialized(Code, Opaque, Payload) ->
-    serialized(Code, Opaque, Payload, #{}).
-
 serialized(Code, Opaque, Payload, ACLInfo) ->
     serialized(Code, Opaque, [], Payload, ACLInfo).
 
