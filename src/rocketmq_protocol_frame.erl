@@ -115,11 +115,21 @@ serialized(Code, Opaque, ExtFields0, Payload, ACLInfo = #{access_key := AK, secr
     ExtFields2 = lists:sort(ExtFields1),
     Signature = sign(SK, ExtFields2, Payload),
     ExtFields = lists:sort([{<<"Signature">>, Signature} | ExtFields2]),
-    Headers = [{<<"extFields">>, ExtFields}],
+    Headers =
+        case length(ExtFields) of
+            0 -> [];
+            _ ->
+                [{<<"extFields">>, ExtFields}]
+        end,
     serialized_(Code, Opaque, Headers, Payload);
 
 serialized(Code, Opaque, ExtFields, Payload, _ACLInfo) ->
-    Headers = [{<<"extFields">>, ExtFields}],
+    Headers =
+        case length(ExtFields) of
+            0 -> [];
+            _ ->
+                [{<<"extFields">>, ExtFields}]
+        end,
     serialized_(Code, Opaque, Headers, Payload).
 
 serialized_(Code, Opaque, Header0, Payload) ->
