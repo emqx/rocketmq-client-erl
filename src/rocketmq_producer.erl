@@ -58,7 +58,7 @@ callback_mode() -> [state_functions].
                 batch_size = 0,
                 requests = #{},
                 last_bin = <<>>,
-                acl_info
+                producer_opts
                 }).
 
 start_link(QueueId, Topic, Server, ProducerGroup, ProducerOpts) ->
@@ -84,7 +84,7 @@ init([QueueId, Topic, Server, ProducerGroup, ProducerOpts]) ->
                    batch_size = maps:get(batch_size, ProducerOpts, 0),
                    server = Server,
                    opts = maps:get(tcp_opts, ProducerOpts, []),
-                   acl_info = maps:get(acl_info, ProducerOpts, #{})
+                   producer_opts = ProducerOpts
                    },
     self() ! connecting,
     {ok, idle, State}.
@@ -118,9 +118,9 @@ connected({call, From}, {send, Message}, State = #state{sock = Sock,
                                                         producer_group = ProducerGroup,
                                                         opaque_id = Opaque,
                                                         requests = Reqs,
-                                                        acl_info = ACLInfo
+                                                        producer_opts = ProducerOpts
                                                         }) ->
-    send(Sock, ProducerGroup, Topic, Opaque, QueueId, {Message, <<>>}, ACLInfo),
+    send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, {Message, <<>>}, get_acl_info(ProducerOpts)),
     {keep_state, next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)})};
 
 connected(cast, {send, Message}, State = #state{sock = Sock,
@@ -129,17 +129,17 @@ connected(cast, {send, Message}, State = #state{sock = Sock,
                                                 producer_group = ProducerGroup,
                                                 opaque_id = Opaque,
                                                 batch_size = BatchSize,
-                                                acl_info = ACLInfo,
+                                                producer_opts = ProducerOpts,
                                                 requests = Requests
                                                 }) ->
     BatchLen =
         case BatchSize =:= 0 of
             true ->
-                _ = send(Sock, ProducerGroup, Topic, Opaque, QueueId, {Message, <<>>}, ACLInfo),
+                _ = send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, {Message, <<>>}, get_acl_info(ProducerOpts)),
                 1;
             false ->
                 Messages = [{Message, <<>>} | collect_send_calls(BatchSize)],
-                _ = batch_send(Sock, ProducerGroup, Topic, Opaque, QueueId, Messages, ACLInfo),
+                _ = batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, Messages, get_acl_info(ProducerOpts)),
                 erlang:length(Messages)
         end,
     NRequests = maps:put(Opaque, {batch_len, BatchLen}, Requests),
@@ -149,8 +149,8 @@ connected(cast, {send, Message}, State = #state{sock = Sock,
 connected(_EventType, ping, State = #state{sock = Sock,
                                            producer_group = ProducerGroup,
                                            opaque_id = Opaque,
-                                           acl_info = ACLInfo}) ->
-    ping(Sock, ProducerGroup, Opaque, ACLInfo),
+                                           producer_opts = ProducerOpts}) ->
+    ping(Sock, ProducerGroup, Opaque, get_acl_info(ProducerOpts)),
     {keep_state, next_opaque_id(State)};
 
 connected(_EventType, EventContent, State) ->
@@ -190,9 +190,9 @@ do_response(Header, Reqs, Callback, Topic) ->
                         false ->
                             case Callback of
                                 {M, F, A} ->
-                                    erlang:apply(M, F, [maps:get(<<"code">>, Header, undefined), Topic, Len] ++ A);
+                                    erlang:apply(M, F, [result(Header), Topic, Len] ++ A);
                                 Callback when is_function(Callback) ->
-                                    Callback(maps:get(<<"code">>, Header, undefined), Topic, Len)
+                                    Callback(result(Header), Topic, Len)
                             end
                     end
             end,
@@ -201,8 +201,14 @@ do_response(Header, Reqs, Callback, Topic) ->
             %% ignore heart beat response
             Reqs;
         From ->
-            gen_statem:reply(From, maps:get(<<"code">>, Header, undefined)),
+            gen_statem:reply(From, result(Header)),
             maps:remove(Opaque, Reqs)
+    end.
+
+result(Header) ->
+    case maps:get(<<"code">>, Header, undefined) of
+        0 -> ok;
+        _ -> {error, Header}
     end.
 
 start_keepalive() ->
@@ -216,12 +222,12 @@ ping(Sock, ProducerGroup, Opaque, ACLInfo) ->
     gen_tcp:send(Sock, Package),
     start_keepalive().
 
-send(Sock, ProducerGroup, Topic, Opaque, QueueId, Message, ACLInfo) ->
-    Package = rocketmq_protocol_frame:send_message_v2(Opaque, ProducerGroup, Topic, QueueId, Message, ACLInfo),
+send(Sock, ProducerGroup, Namespace, Topic, Opaque, QueueId, Message, ACLInfo) ->
+    Package = rocketmq_protocol_frame:send_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, Message, ACLInfo),
     gen_tcp:send(Sock, Package).
 
-batch_send(Sock, ProducerGroup, Topic, Opaque, QueueId, Messages, ACLInfo) ->
-    Package = rocketmq_protocol_frame:send_batch_message_v2(Opaque, ProducerGroup, Topic, QueueId, Messages, ACLInfo),
+batch_send(Sock, ProducerGroup, Namespace, Topic, Opaque, QueueId, Messages, ACLInfo) ->
+    Package = rocketmq_protocol_frame:send_batch_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, Messages, ACLInfo),
     gen_tcp:send(Sock, Package).
 
 
@@ -275,3 +281,10 @@ next_opaque_id(State = #state{opaque_id = ?MAX_SEQ_ID}) ->
     State#state{opaque_id = 1};
 next_opaque_id(State = #state{opaque_id = OpaqueId}) ->
     State#state{opaque_id = OpaqueId+1}.
+
+
+get_acl_info(ProducerOpts) ->
+    maps:get(acl_info, ProducerOpts, #{}).
+
+get_namespace(ProducerOpts) ->
+    maps:get(namespace, ProducerOpts, <<>>).

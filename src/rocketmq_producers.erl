@@ -203,11 +203,9 @@ get_name(ProducerOpts) -> maps:get(name, ProducerOpts, ?MODULE).
 log_error(Fmt, Args) ->
     error_logger:error_msg(Fmt, Args).
 
-maybe_start_producer(Pid, {Header, undefined}, State = #state{topic = Topic}) ->
-    log_error("Start topic:~p producer fail:~p", [Topic, maps:get(<<"remark">>, Header, undefined)]),
-    Result = rocketmq_client:get_routeinfo_by_topic(Pid, <<"TBW102">>),
-    % erlang:error({start_producer_failed, Result});
-    maybe_start_producer(Pid, Result, State);
+maybe_start_producer(_Pid, {Header, undefined}, #state{topic = Topic}) ->
+    log_error("Start producer failed, topic: ~p, remark: ~p", [Topic, maps:get(<<"remark">>, Header, undefined)]),
+    erlang:error({start_producer_failed, Header});
 
 maybe_start_producer(_, {_, Payload}, State = #state{producers = Producers}) ->
     BrokerDatas = maps:get(<<"brokerDatas">>, Payload, []),
