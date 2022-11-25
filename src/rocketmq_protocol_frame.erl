@@ -21,20 +21,23 @@
 -define(SEND_MESSAGE_V2, 310).
 -define(SEND_BATCH_MESSAGE, 320).
 
--export([ get_routeinfo_by_topic/3
-        , send_message_v2/6
-        , send_batch_message_v2/6
+-export([ get_routeinfo_by_topic/4
+        , send_message_v2/7
+        , send_batch_message_v2/7
         , heart_beat/4
         ]).
 
 -export([parse/1]).
 
+-define(DEFAULT_TOPIC, <<"TBW102">>).
+
 % 6 Read/Write
 % 4 not write
 % 2 not read
 
-get_routeinfo_by_topic(Opaque, Topic, ACLInfo) ->
-    serialized(?GET_ROUTEINTO_BY_TOPIC, Opaque, [{<<"topic">>, Topic}], <<"">>, ACLInfo).
+get_routeinfo_by_topic(Opaque, Namespace, Topic, ACLInfo) ->
+    ExHeaders = [{<<"topic">>, maybe_with_namespace(Namespace, Topic)}],
+    serialized(?GET_ROUTEINTO_BY_TOPIC, Opaque, ExHeaders, <<"">>, ACLInfo).
 
 % Header field is
 % ProducerGroup
@@ -42,24 +45,15 @@ get_routeinfo_by_topic(Opaque, Topic, ACLInfo) ->
 % QueueId
 % BornTimestamp
 % Properties
-send_message_v2(Opaque, ProducerGroup, Topic, QueueId, {Payload, Properties}, ACLInfo) ->
-    ExtFields = [{<<"a">>, ProducerGroup},
-                 {<<"b">>, Topic},
-                 {<<"e">>, integer_to_binary(QueueId)},
-                 {<<"i">>, Properties},
-                 {<<"g">>, integer_to_binary(erlang:system_time(millisecond))}
-                 | single_message_fixed_headers()],
+send_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, {Payload, Properties}, ACLInfo) ->
+    ExtFields = basic_ext_headers(ProducerGroup, Namespace, Topic, QueueId, Properties)
+        ++ single_message_fixed_headers(Namespace),
     serialized(?SEND_MESSAGE_V2, Opaque, ExtFields, Payload, ACLInfo).
 
-send_batch_message_v2(Opaque, ProducerGroup, Topic, QueueId, Payloads, ACLInfo) ->
-    ExtFields = [{<<"a">>, ProducerGroup},
-                 {<<"b">>, Topic},
-                 {<<"e">>, integer_to_binary(QueueId)},
-                 {<<"i">>, <<>>},
-                 {<<"g">>, integer_to_binary(erlang:system_time(millisecond))}
-                 | batch_message_fixed_headers()],
-    I = batch_message(Payloads),
-    serialized(?SEND_BATCH_MESSAGE, Opaque, ExtFields, I, ACLInfo).
+send_batch_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, Payloads, ACLInfo) ->
+    ExtFields = basic_ext_headers(ProducerGroup, Namespace, Topic, QueueId, <<>>)
+        ++ batch_message_fixed_headers(Namespace),
+    serialized(?SEND_BATCH_MESSAGE, Opaque, ExtFields, batch_message(Payloads), ACLInfo).
 
 heart_beat(Opaque, ClientID, GroupName, ACLInfo) ->
     Payload = [{<<"clientID">>, ClientID},
@@ -153,6 +147,9 @@ plist_value_binary([{_K, V} | List], Res) ->
     VBin = bin(V),
     plist_value_binary(List, <<VBin/binary, Res/binary>>).
 
+maybe_with_namespace(<<>>, ResourceName) -> ResourceName;
+maybe_with_namespace(Namespace, ResourceName) ->
+    <<Namespace/binary, "%", ResourceName/binary>>.
 
 bin(Bin) when is_binary(Bin) -> Bin;
 bin(Num) when is_number(Num) -> number_to_binary(Num);
@@ -168,7 +165,7 @@ header_base() ->
     [{<<"flag">>, 0},
      {<<"language">>, <<"ERLANG">>},
      {<<"serializeTypeCurrentRPC">>, <<"JSON">>},
-     {<<"version">>, 315}].
+     {<<"version">>, 401}].
 
 % String a;// producerGroup;
 % String b;// topic;
@@ -183,12 +180,22 @@ header_base() ->
 % boolean k;// unitMode = false;
 % boolean m;// batch message;
 
-single_message_fixed_headers() -> [{<<"m">>, <<"false">>} | message_fixed_headers()].
+basic_ext_headers(ProducerGroup, Namespace, Topic, QueueId, Properties) ->
+    [{<<"a">>, maybe_with_namespace(Namespace, ProducerGroup)},
+     {<<"b">>, maybe_with_namespace(Namespace, Topic)},
+     {<<"e">>, integer_to_binary(QueueId)},
+     {<<"i">>, Properties},
+     {<<"g">>, integer_to_binary(erlang:system_time(millisecond))}
+    ].
 
-batch_message_fixed_headers() -> [{<<"m">>, <<"true">>} | message_fixed_headers()].
+single_message_fixed_headers(Namespace) ->
+    [{<<"m">>, <<"false">>} | message_fixed_headers(Namespace)].
 
-message_fixed_headers() ->
-    [{<<"c">>, <<"TBW102">>},
+batch_message_fixed_headers(Namespace) ->
+    [{<<"m">>, <<"true">>} | message_fixed_headers(Namespace)].
+
+message_fixed_headers(Namespace) ->
+    [{<<"c">>, maybe_with_namespace(Namespace, ?DEFAULT_TOPIC)},
      {<<"d">>, 8},
      {<<"f">>, 0},
      {<<"h">>, 0},
