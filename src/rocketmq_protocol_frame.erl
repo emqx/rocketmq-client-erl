@@ -16,6 +16,8 @@
 
 -module(rocketmq_protocol_frame).
 
+-include("rocketmq.hrl").
+
 -define(HEART_BEAT, 34).
 -define(GET_ROUTEINTO_BY_TOPIC, 105).
 -define(SEND_MESSAGE_V2, 310).
@@ -28,8 +30,6 @@
         ]).
 
 -export([parse/1]).
-
--define(DEFAULT_TOPIC, <<"TBW102">>).
 
 % 6 Read/Write
 % 4 not write

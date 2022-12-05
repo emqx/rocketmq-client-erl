@@ -16,6 +16,8 @@
 
 -module(rocketmq_producers).
 
+-include("rocketmq.hrl").
+
 %% APIs
 -export([start_link/4]).
 %% gen_server callbacks
@@ -42,6 +44,8 @@
                 producer_group,
                 broker_datas,
                 ref_topic_route_interval = 5000}).
+
+-define(RESTART_INTERVAL, 3000).
 
 start_supervised(ClientId, ProducerGroup, Topic, ProducerOpts) ->
   {ok, Pid} = rocketmq_producers_sup:ensure_present(ClientId, ProducerGroup, Topic, ProducerOpts),
@@ -133,11 +137,10 @@ handle_call(_Call, _From, State) ->
 handle_cast(_Cast, State) ->
     {noreply, State}.
 
-handle_info(timeout, State = #state{client_id = ClientId, topic = Topic}) ->
+handle_info(timeout, State = #state{client_id = ClientId}) ->
     case rocketmq_client_sup:find_client(ClientId) of
         {ok, Pid} ->
-            Result = rocketmq_client:get_routeinfo_by_topic(Pid, Topic),
-            {QueueNums, NewProducers, BrokerDatas} = maybe_start_producer(Pid, Result, State),
+            {QueueNums, NewProducers, BrokerDatas} = maybe_start_producer(Pid, State),
             {noreply, State#state{queue_nums = QueueNums,
                                   producers = NewProducers,
                                   broker_datas = BrokerDatas}};
@@ -145,14 +148,15 @@ handle_info(timeout, State = #state{client_id = ClientId, topic = Topic}) ->
             {stop, Reason, State}
     end;
 
-handle_info({'EXIT', Pid, _Error}, State = #state{workers = Workers, producers = Producers}) ->
+handle_info({'EXIT', Pid, _Error}, State = #state{workers = Workers, producers = Producers, producer_opts = ProducerOpts}) ->
     case maps:get(Pid, Producers, undefined) of
         undefined ->
             log_error("Not find Pid:~p producer", [Pid]),
             {noreply, State};
         {BrokerAddrs, QueueNum} ->
             ets:delete(Workers, QueueNum),
-            self() ! {start_producer, BrokerAddrs, QueueNum},
+            RestartAfter = maps:get(producer_restart_interval, ProducerOpts, ?RESTART_INTERVAL),
+            erlang:send_after(RestartAfter, self(), {start_producer, BrokerAddrs, QueueNum}),
             {noreply, State#state{producers = maps:remove(Pid, Producers)}}
     end;
 
@@ -203,15 +207,27 @@ get_name(ProducerOpts) -> maps:get(name, ProducerOpts, ?MODULE).
 log_error(Fmt, Args) ->
     error_logger:error_msg(Fmt, Args).
 
-maybe_start_producer(_Pid, {Header, undefined}, #state{topic = Topic}) ->
-    log_error("Start producer failed, topic: ~p, remark: ~p", [Topic, maps:get(<<"remark">>, Header, undefined)]),
-    erlang:error({start_producer_failed, Header});
+maybe_start_producer(Pid, State = #state{topic = Topic, producers = Producers}) ->
+    case rocketmq_client:get_routeinfo_by_topic(Pid, Topic) of
+        {_Header, undefined} ->
+            %% Try again using the default topic, as the 'Topic' does not exists for now.
+            %% Note that the topic will be created by the rocketmq server automatically
+            %% at first time we send message to it, if the user has configured
+            %% `autoCreateTopicEnable = true` in the rocketmq server side.
+            maybe_start_producer_using_default_topic(Pid, State);
+        {_, RouteInfo} ->
+            start_producer(RouteInfo, Producers, State)
+    end.
 
-maybe_start_producer(_, {_, Payload}, State = #state{producers = Producers}) ->
-    BrokerDatas = maps:get(<<"brokerDatas">>, Payload, []),
-    QueueDatas = maps:get(<<"queueDatas">>, Payload, []),
-    {QueueNums, NewProducers} = start_producer(0, BrokerDatas, QueueDatas, Producers, State),
-    {QueueNums, NewProducers, BrokerDatas}.
+maybe_start_producer_using_default_topic(Pid, State = #state{producers = Producers}) ->
+    case rocketmq_client:get_routeinfo_by_topic(Pid, ?DEFAULT_TOPIC) of
+        {Header, undefined} ->
+            log_error("Start producer failed, remark: ~p",
+                [maps:get(<<"remark">>, Header, undefined)]),
+            erlang:error({start_producer_failed, Header});
+        {_, RouteInfo} ->
+            start_producer(RouteInfo, Producers, State)
+    end.
 
 find_queue_data(_Key, []) ->
     [];
@@ -221,6 +237,12 @@ find_queue_data(Key, [QueueData | QueueDatas]) ->
         true -> QueueData;
         false -> find_queue_data(Key, QueueDatas)
     end.
+
+start_producer(RouteInfo, Producers, State) ->
+    BrokerDatas = maps:get(<<"brokerDatas">>, RouteInfo, []),
+    QueueDatas = maps:get(<<"queueDatas">>, RouteInfo, []),
+    {QueueNums, NewProducers} = start_producer(0, BrokerDatas, QueueDatas, Producers, State),
+    {QueueNums, NewProducers, BrokerDatas}.
 
 start_producer(Start, BrokerDatas,  QueueDatas, Producers, State = #state{topic = Topic}) ->
     lists:foldl(fun(BrokerData, {QueueNumAcc, ProducersAcc}) ->
