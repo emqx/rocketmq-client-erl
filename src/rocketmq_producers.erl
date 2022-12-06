@@ -121,12 +121,34 @@ init([ClientId, ProducerGroup, Topic, ProducerOpts]) ->
     erlang:process_flag(trap_exit, true),
     RefTopicRouteInterval = maps:get(ref_topic_route_interval, ProducerOpts, 5000),
     erlang:send_after(RefTopicRouteInterval, self(), ref_topic_route),
-    {ok, #state{topic = Topic,
-                client_id = ClientId,
-                producer_opts = ProducerOpts,
-                producer_group = ProducerGroup,
-                ref_topic_route_interval = RefTopicRouteInterval,
-                workers = ets:new(get_name(ProducerOpts), [protected, named_table, {read_concurrency, true}])}, 0}.
+    State = #state{
+        topic = Topic,
+        client_id = ClientId,
+        producer_opts = ProducerOpts,
+        producer_group = ProducerGroup,
+        ref_topic_route_interval = RefTopicRouteInterval,
+        workers = ets:new(get_name(ProducerOpts), [protected, named_table, {read_concurrency, true}])
+    },
+    case init_producers(ClientId, State) of
+        {ok, State1} -> {ok, State1};
+        {error, Reason} -> {stop, Reason}
+    end.
+
+init_producers(ClientId, State) ->
+    case rocketmq_client_sup:find_client(ClientId) of
+        {ok, Pid} ->
+            case maybe_start_producer(Pid, State) of
+                {ok, {QueueNums, NewProducers, BrokerDatas}} ->
+                    {ok, State#state{
+                            queue_nums = QueueNums,
+                            producers = NewProducers,
+                            broker_datas = BrokerDatas}};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 handle_call(get_workers, _From, State = #state{workers = Workers, queue_nums = QueueNum}) ->
     {reply, {QueueNum, Workers}, State};
@@ -136,17 +158,6 @@ handle_call(_Call, _From, State) ->
 
 handle_cast(_Cast, State) ->
     {noreply, State}.
-
-handle_info(timeout, State = #state{client_id = ClientId}) ->
-    case rocketmq_client_sup:find_client(ClientId) of
-        {ok, Pid} ->
-            {QueueNums, NewProducers, BrokerDatas} = maybe_start_producer(Pid, State),
-            {noreply, State#state{queue_nums = QueueNums,
-                                  producers = NewProducers,
-                                  broker_datas = BrokerDatas}};
-        {error, Reason} ->
-            {stop, Reason, State}
-    end;
 
 handle_info({'EXIT', Pid, _Error}, State = #state{workers = Workers, producers = Producers, producer_opts = ProducerOpts}) ->
     case maps:get(Pid, Producers, undefined) of
@@ -216,7 +227,7 @@ maybe_start_producer(Pid, State = #state{topic = Topic, producers = Producers}) 
             %% `autoCreateTopicEnable = true` in the rocketmq server side.
             maybe_start_producer_using_default_topic(Pid, State);
         {_, RouteInfo} ->
-            start_producer(RouteInfo, Producers, State)
+            start_producer_with_route_info(RouteInfo, Producers, State)
     end.
 
 maybe_start_producer_using_default_topic(Pid, State = #state{producers = Producers}) ->
@@ -224,9 +235,9 @@ maybe_start_producer_using_default_topic(Pid, State = #state{producers = Produce
         {Header, undefined} ->
             log_error("Start producer failed, remark: ~p",
                 [maps:get(<<"remark">>, Header, undefined)]),
-            erlang:error({start_producer_failed, Header});
+            {error, {start_producer_failed, Header}};
         {_, RouteInfo} ->
-            start_producer(RouteInfo, Producers, State)
+            start_producer_with_route_info(RouteInfo, Producers, State)
     end.
 
 find_queue_data(_Key, []) ->
@@ -238,11 +249,11 @@ find_queue_data(Key, [QueueData | QueueDatas]) ->
         false -> find_queue_data(Key, QueueDatas)
     end.
 
-start_producer(RouteInfo, Producers, State) ->
+start_producer_with_route_info(RouteInfo, Producers, State) ->
     BrokerDatas = maps:get(<<"brokerDatas">>, RouteInfo, []),
     QueueDatas = maps:get(<<"queueDatas">>, RouteInfo, []),
     {QueueNums, NewProducers} = start_producer(0, BrokerDatas, QueueDatas, Producers, State),
-    {QueueNums, NewProducers, BrokerDatas}.
+    {ok, {QueueNums, NewProducers, BrokerDatas}}.
 
 start_producer(Start, BrokerDatas,  QueueDatas, Producers, State = #state{topic = Topic}) ->
     lists:foldl(fun(BrokerData, {QueueNumAcc, ProducersAcc}) ->

@@ -62,7 +62,7 @@ init([Servers, Opts]) ->
     State = #state{servers = Servers, opts = Opts},
     case get_sock(Servers, undefined) of
         error ->
-            {error, fail_to_connect_rocketmq_server};
+            {stop, fail_to_connect_rocketmq_server};
         Sock ->
             {ok, State#state{sock = Sock, opaque_id = 1, requests = #{}}}
     end.
