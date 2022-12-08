@@ -262,7 +262,7 @@ start_producer(Start, BrokerDatas,  QueueDatas, Producers, State = #state{topic 
         QueueData = find_queue_data(BrokerName, QueueDatas),
         case maps:get(<<"perm">>, QueueData) =:= 4 of
             true ->
-                log_error("Start producer fail tioic:~p permission denied:~p", [Topic]),
+                log_error("Start producer fail; topic: ~p; permission denied", [Topic]),
                 {QueueNumAcc, ProducersAcc};
             false ->
                 QueueNum = maps:get(<<"writeQueueNums">>, QueueData),
