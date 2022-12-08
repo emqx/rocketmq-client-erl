@@ -33,7 +33,9 @@
         , stop_supervised/1
         ]).
 
--export([pick_producer/1]).
+-export([ pick_producer/1
+        , pick_producer/2
+        ]).
 
 -record(state, {topic,
                 client_id,
@@ -47,50 +49,77 @@
 
 -define(RESTART_INTERVAL, 3000).
 
+-type queue_number() :: non_neg_integer().
+-type queue_count() :: pos_integer().
+-type clientid() :: atom().
+-type topic() :: binary().
+-type partitioner() :: roundrobin | key_dispatch.
+-type producer_group() :: binary().
+-type producers() :: #{ client := clientid()
+                      , topic := topic()
+                      , workers := ets:table()
+                      , queue_nums := queue_count()
+                      , partitioner := partitioner()
+                      }.
+-type producer_opts() :: map().
+-type produce_context() :: #{ key => term()
+                            , any() => term()
+                            }.
+
+-export_type([ producers/0
+             , produce_context/0
+             ]).
+
+-spec start_supervised(clientid(), producer_group(), topic(), producer_opts()) -> {ok, producers()}.
 start_supervised(ClientId, ProducerGroup, Topic, ProducerOpts) ->
   {ok, Pid} = rocketmq_producers_sup:ensure_present(ClientId, ProducerGroup, Topic, ProducerOpts),
-  {QueueNums, Workers} = gen_server:call(Pid, get_workers, infinity),
+  {QueueCount, Workers} = gen_server:call(Pid, get_workers, infinity),
   {ok, #{client => ClientId,
          topic => Topic,
          workers => Workers,
-         queue_nums => QueueNums
+         queue_nums => QueueCount,
+         partitioner => maps:get(partitioner, ProducerOpts, roundrobin)
         }}.
 
 stop_supervised(#{client := ClientId, workers := Workers}) ->
   rocketmq_producers_sup:ensure_absence(ClientId, Workers).
 
-pick_producer(#{workers := Workers, queue_nums := QueueNums0, topic := Topic}) ->
-    QueueNums1 =  case ets:lookup(rocketmq_topic, Topic) of
-        [] -> QueueNums0;
-        [{_, QueueNums}] -> QueueNums
-    end,
-    QueueNum = pick_queue_num(QueueNums1),
-    do_pick_producer(QueueNum, QueueNums1, Workers).
+-spec pick_producer(producers()) -> {queue_number(), pid()}.
+pick_producer(Producers) ->
+    Context = #{},
+    pick_producer(Producers, Context).
 
-do_pick_producer(QueueNum0, QueueNums, Workers) ->
+-spec pick_producer(producers(), produce_context()) -> {queue_number(), pid()}.
+pick_producer(Producers = #{workers := Workers, queue_nums := QueueCount, topic := Topic},
+              Context = #{}) ->
+    Partitioner = maps:get(partitioner, Producers, roundrobin),
+    QueueNum = pick_queue_num(Partitioner, QueueCount, Topic, Context),
+    do_pick_producer(QueueNum, QueueCount, Workers).
+
+do_pick_producer(QueueNum0, QueueCount, Workers) ->
     Pid0 = lookup_producer(Workers, QueueNum0),
     case is_pid(Pid0) andalso is_process_alive(Pid0) of
         true ->
             {QueueNum0, Pid0};
         false ->
-            R = {QueueNum1, _Pid1} = pick_next_alive(Workers, QueueNum0, QueueNums),
-            _ = put(rocketmq_roundrobin, (QueueNum1 + 1) rem QueueNums),
+            R = {QueueNum1, _Pid1} = pick_next_alive(Workers, QueueNum0, QueueCount),
+            _ = put(rocketmq_roundrobin, (QueueNum1 + 1) rem QueueCount),
             R
     end.
 
-pick_next_alive(Workers, QueueNum, QueueNums) ->
-    pick_next_alive(Workers, (QueueNum + 1) rem QueueNums, QueueNums, _Tried = 1).
+pick_next_alive(Workers, QueueNum, QueueCount) ->
+    pick_next_alive(Workers, (QueueNum + 1) rem QueueCount, QueueCount, _Tried = 1).
 
-pick_next_alive(_Workers, _QueueNum, QueueNums, QueueNums) ->
+pick_next_alive(_Workers, _QueueNum, QueueCount, QueueCount) ->
     erlang:error(all_producers_down);
-pick_next_alive(Workers, QueueNum, QueueNums, Tried) ->
+pick_next_alive(Workers, QueueNum, QueueCount, Tried) ->
     case lookup_producer(Workers, QueueNum) of
         {error, _} ->
-            pick_next_alive(Workers, (QueueNum + 1) rem QueueNums, QueueNums, Tried + 1);
+            pick_next_alive(Workers, (QueueNum + 1) rem QueueCount, QueueCount, Tried + 1);
         Pid ->
             case is_alive(Pid) of
                 true -> {QueueNum, Pid};
-                false -> pick_next_alive(Workers, (QueueNum + 1) rem QueueNums, QueueNums, Tried + 1)
+                false -> pick_next_alive(Workers, (QueueNum + 1) rem QueueCount, QueueCount, Tried + 1)
             end
     end.
 
@@ -106,13 +135,20 @@ lookup_producer(Workers, QueueNum) ->
         [{QueueNum, Pid}] -> Pid
     end.
 
-pick_queue_num(QueueNums) ->
+-spec pick_queue_num(partitioner(), queue_count(), topic(), produce_context()) -> queue_number().
+pick_queue_num(roundrobin, QueueCount0, Topic, _Context) ->
+    QueueCount =  case ets:lookup(rocketmq_topic, Topic) of
+        [] -> QueueCount0;
+        [{_, QueueCount1}] -> QueueCount1
+    end,
     QueueNum = case get(rocketmq_roundrobin) of
         undefined -> 0;
         Number    -> Number
     end,
-    _ = put(rocketmq_roundrobin, (QueueNum + 1) rem QueueNums),
-    QueueNum.
+    _ = put(rocketmq_roundrobin, (QueueNum + 1) rem QueueCount),
+    QueueNum;
+pick_queue_num(key_dispatch, QueueCount, _Topic, _Context = #{key := Key}) ->
+    erlang:phash2(Key, QueueCount).
 
 start_link(ClientId, ProducerGroup, Topic, ProducerOpts) ->
     gen_server:start_link({local, get_name(ProducerOpts)}, ?MODULE, [ClientId, ProducerGroup, Topic, ProducerOpts], []).
