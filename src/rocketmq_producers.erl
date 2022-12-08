@@ -67,14 +67,14 @@ pick_producer(#{workers := Workers, queue_nums := QueueNums0, topic := Topic}) -
     QueueNum = pick_queue_num(QueueNums1),
     do_pick_producer(QueueNum, QueueNums1, Workers).
 
-do_pick_producer(QueueNum, QueueNums, Workers) ->
-    Pid = lookup_producer(Workers, QueueNum),
-    case is_pid(Pid) andalso is_process_alive(Pid) of
+do_pick_producer(QueueNum0, QueueNums, Workers) ->
+    Pid0 = lookup_producer(Workers, QueueNum0),
+    case is_pid(Pid0) andalso is_process_alive(Pid0) of
         true ->
-            {QueueNum, Pid};
+            {QueueNum0, Pid0};
         false ->
-            R = {QueueNum, Pid} = pick_next_alive(Workers, QueueNum, QueueNums),
-            _ = put(rocketmq_roundrobin, (QueueNum + 1) rem QueueNums),
+            R = {QueueNum1, _Pid1} = pick_next_alive(Workers, QueueNum0, QueueNums),
+            _ = put(rocketmq_roundrobin, (QueueNum1 + 1) rem QueueNums),
             R
     end.
 
