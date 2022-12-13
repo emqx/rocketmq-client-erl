@@ -52,11 +52,19 @@ ensure_supervised_producers(ClientId, ProducerGroup, Topic, Opts) ->
 stop_and_delete_supervised_producers(Producers) ->
     rocketmq_producers:stop_supervised(Producers).
 
-
-send(Producers, Message) ->
-    {_Partition, ProducerPid} = rocketmq_producers:pick_producer(Producers),
+-spec send(rocketmq_producers:producers(),
+           binary() | {binary(), rocketmq_producers:produce_context()}) -> ok.
+send(Producers, Message) when is_binary(Message) ->
+    send(Producers, {Message, _Context = #{}});
+send(Producers, {Message, Context}) when is_map(Context) ->
+    {_Partition, ProducerPid} = rocketmq_producers:pick_producer(Producers, Context),
     rocketmq_producer:send(ProducerPid, Message).
 
-send_sync(Producers, Message, Timeout) ->
-    {_Partition, ProducerPid} = rocketmq_producers:pick_producer(Producers),
+-spec send_sync(rocketmq_producers:producers(),
+                binary() | {binary(), rocketmq_producers:produce_context()},
+                timer:time()) -> ok | {error, term()}.
+send_sync(Producers, Message, Timeout) when is_binary(Message) ->
+    send_sync(Producers, {Message, _Context = #{}}, Timeout);
+send_sync(Producers, {Message, Context}, Timeout) when is_map(Context) ->
+    {_Partition, ProducerPid} = rocketmq_producers:pick_producer(Producers, Context),
     rocketmq_producer:send_sync(ProducerPid, Message, Timeout).
