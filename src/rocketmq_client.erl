@@ -36,6 +36,7 @@
 -record(state, {requests, opaque_id, sock, servers, opts, last_bin = <<>>}).
 
 -define(TIMEOUT, 60000).
+-define(T_GET_ROUTEINFO, 15000).
 
 -define(TCPOPTIONS, [
     binary,
@@ -50,7 +51,14 @@ start_link(ClientId, Servers, Opts) ->
     gen_server:start_link({local, ClientId}, ?MODULE, [Servers, Opts], []).
 
 get_routeinfo_by_topic(Pid, Topic) ->
-    gen_server:call(Pid, {get_routeinfo_by_topic, Topic}).
+    try
+        gen_server:call(Pid, {get_routeinfo_by_topic, Topic}, ?T_GET_ROUTEINFO)
+    catch
+        exit:{timeout, _Details} ->
+            {error, timeout};
+        exit:Reason ->
+            {error, {rocketmq_client_down, Reason}}
+    end.
 
 get_status(Pid) ->
     gen_server:call(Pid, get_status, 5000).
@@ -133,7 +141,7 @@ do_response(Header, Payload, Reqs) ->
         undefined ->
             Reqs;
         From ->
-            gen_server:reply(From, {Header, Payload}),
+            gen_server:reply(From, {ok, {Header, Payload}}),
             maps:remove(OpaqueId, Reqs)
     end.
 
@@ -160,7 +168,7 @@ try_connect([{Host, Port} | Servers]) ->
     end.
 
 log_error(Fmt, Args) ->
-    error_logger:error_msg(Fmt, Args).
+    logger:error("[rocketmq_client]: " ++ Fmt, Args).
 
 next_opaque_id(State = #state{opaque_id = 65535}) ->
     State#state{opaque_id = 1};

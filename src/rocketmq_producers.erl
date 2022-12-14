@@ -163,11 +163,11 @@ init([ClientId, ProducerGroup, Topic, ProducerOpts]) ->
         producer_opts = ProducerOpts,
         producer_group = ProducerGroup,
         ref_topic_route_interval = RefTopicRouteInterval,
-        workers = ets:new(get_name(ProducerOpts), [protected, named_table, {read_concurrency, true}])
+        workers = ensure_ets_created(get_name(ProducerOpts))
     },
     case init_producers(ClientId, State) of
         {ok, State1} -> {ok, State1};
-        {error, Reason} -> {stop, Reason}
+        {error, Reason} -> {stop, {shutdown, Reason}}
     end.
 
 init_producers(ClientId, State) ->
@@ -221,9 +221,9 @@ handle_info(ref_topic_route, State = #state{client_id = ClientId,
         {ok, Pid} ->
             erlang:send_after(RefTopicRouteInterval, self(), ref_topic_route),
             case rocketmq_client:get_routeinfo_by_topic(Pid, Topic) of
-                {_, undefined} ->
+                {ok, {_, undefined}} ->
                     {noreply, State};
-                {_, Payload} ->
+                {ok, {_, Payload}} ->
                     BrokerDatas1 = lists:sort(maps:get(<<"brokerDatas">>, Payload, [])),
                     case BrokerDatas1 -- lists:sort(BrokerDatas) of
                         [] -> {noreply, State};
@@ -234,7 +234,10 @@ handle_info(ref_topic_route, State = #state{client_id = ClientId,
                             {noreply, State#state{queue_nums = NewQueueNums,
                                                 producers = NewProducers,
                                                 broker_datas = BrokerDatas1}}
-                    end
+                    end;
+                {error, Reason} ->
+                    log_error("Get routeinfo by topic failed: ~p", [Reason]),
+                    {noreply, State}
                 end;
         {error, Reason} ->
             {stop, Reason, State}
@@ -256,24 +259,30 @@ log_error(Fmt, Args) ->
 
 maybe_start_producer(Pid, State = #state{topic = Topic, producers = Producers}) ->
     case rocketmq_client:get_routeinfo_by_topic(Pid, Topic) of
-        {_Header, undefined} ->
+        {ok, {_Header, undefined}} ->
             %% Try again using the default topic, as the 'Topic' does not exists for now.
             %% Note that the topic will be created by the rocketmq server automatically
             %% at first time we send message to it, if the user has configured
             %% `autoCreateTopicEnable = true` in the rocketmq server side.
             maybe_start_producer_using_default_topic(Pid, State);
-        {_, RouteInfo} ->
-            start_producer_with_route_info(RouteInfo, Producers, State)
+        {ok, {_, RouteInfo}} ->
+            start_producer_with_route_info(RouteInfo, Producers, State);
+        {error, Reason} ->
+            log_error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, Topic]),
+            {error, {get_routeinfo_by_topic_failed, Reason}}
     end.
 
 maybe_start_producer_using_default_topic(Pid, State = #state{producers = Producers}) ->
     case rocketmq_client:get_routeinfo_by_topic(Pid, ?DEFAULT_TOPIC) of
-        {Header, undefined} ->
+        {ok, {Header, undefined}} ->
             log_error("Start producer failed, remark: ~p",
                 [maps:get(<<"remark">>, Header, undefined)]),
             {error, {start_producer_failed, Header}};
-        {_, RouteInfo} ->
-            start_producer_with_route_info(RouteInfo, Producers, State)
+        {ok, {_, RouteInfo}} ->
+            start_producer_with_route_info(RouteInfo, Producers, State);
+        {error, Reason} ->
+            log_error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, ?DEFAULT_TOPIC]),
+            {error, {get_routeinfo_by_topic_failed, Reason}}
     end.
 
 find_queue_data(_Key, []) ->
@@ -318,3 +327,9 @@ do_start_producer(BrokerAddrs, QueueSeq, Producers, #state{workers = Workers,
     {ok, Producer} = rocketmq_producer:start_link(QueueSeq, Topic, Server, ProducerGroup, ProducerOpts),
     ets:insert(Workers, {QueueSeq, Producer}),
     maps:put(Producer, {BrokerAddrs, QueueSeq}, Producers).
+
+ensure_ets_created(TabName) ->
+    try ets:new(TabName, [protected, named_table, {read_concurrency, true}])
+    catch
+        error:badarg -> TabName %% already exists
+    end.
