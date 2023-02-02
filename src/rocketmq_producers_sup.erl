@@ -56,11 +56,12 @@ ensure_absence(ClientId, Name) ->
     end.
 
 child_spec(ClientId, ProducerGroup, Topic, ProducerOpts) ->
-    #{id => ?WORKER_ID(ClientId, get_name(ProducerOpts)),
+    #{
+        id => ?WORKER_ID(ClientId, get_name(ProducerOpts)),
         start => {rocketmq_producers, start_link, [ClientId, ProducerGroup, Topic, ProducerOpts]},
         restart => transient,
         type => worker,
-        modules => [rocketmq_producer]
+        modules => [rocketmq_producers]
     }.
 
 get_name(ProducerOpts) -> maps:get(name, ProducerOpts, rocketmq_producers).

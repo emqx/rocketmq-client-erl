@@ -311,11 +311,11 @@ start_producer(Start, BrokerDatas,  QueueDatas, Producers, State = #state{topic 
                 {QueueNumAcc, ProducersAcc};
             false ->
                 QueueNum = maps:get(<<"writeQueueNums">>, QueueData),
-                QueueNumAcc1 = QueueNumAcc + QueueNum,
-                ProducersAcc1 = lists:foldl(fun(QueueSeq, Acc) ->
-                    do_start_producer(BrokerAddrs, QueueSeq, Acc, State)
-                end, ProducersAcc, lists:seq(QueueNumAcc, QueueNumAcc1 -1)),
-                {QueueNumAcc1, ProducersAcc1}
+                ProducersAcc1 =
+                    lists:foldl(fun(QueueSeq, Acc) ->
+                            do_start_producer(BrokerAddrs, QueueSeq, Acc, State)
+                        end, ProducersAcc, lists:seq(0, QueueNum - 1)),
+                {QueueNumAcc + QueueNum, ProducersAcc1}
         end
     end, {Start, Producers}, BrokerDatas).
 
