@@ -2,8 +2,12 @@
 
 -export([start/0, callback/3]).
 
+-include_lib("eunit/include/eunit.hrl").
+
+run_test() ->
+    ok = start().
+
 start() ->
-    %% test:start().
     application:ensure_all_started(rocketmq),
     Clientid = 'test-client',
     Servers = [{"127.0.0.1", 9876}],
@@ -11,7 +15,7 @@ start() ->
     ClientCfg = #{acl_info => AclInfo},
     {ok, Pid} = rocketmq:ensure_supervised_client(Clientid, Servers, ClientCfg),
     io:format("start client ~p~n", [Pid]),
-    Topic = <<"topicB">>,
+    Topic = <<"test-topic">>,
     ProducerGroup = list_to_binary(lists:concat([Clientid, "_", binary_to_list(Topic)])),
 
     ProducerOpts =

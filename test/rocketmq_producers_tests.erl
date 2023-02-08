@@ -72,6 +72,7 @@ pick_producer_roundrobin_dead_producer_test() ->
     kill_producer(Pid2),
     ?assertError(all_producers_down, rocketmq_producers:pick_producer(Producers, #{key => <<"k2">>})),
 
+    true = ets:delete(rocketmq_topic),
     ok.
 
 pick_producer_key_dispatch_dead_producer_test() ->
@@ -104,4 +105,5 @@ pick_producer_key_dispatch_dead_producer_test() ->
     kill_producer(Pid4),
     ?assertError(all_producers_down, rocketmq_producers:pick_producer(Producers, #{key => <<"k2">>})),
 
+    true = ets:delete(rocketmq_topic),
     ok.

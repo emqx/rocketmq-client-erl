@@ -1,0 +1,48 @@
+version: '3.9'
+
+services:
+  rocketmq_server:
+    container_name: rocketmq_server
+    image: foxiswho/rocketmq:server-4.6.1
+    ports:
+      - "9876:9876"
+    networks:
+      rocketmq_test_bridge:
+        ipv4_address: 172.101.239.100
+  rocketmq_broker:
+    image: foxiswho/rocketmq:broker-4.6.1
+    container_name: rmqbroker
+    ports:
+      - 10909:10909
+      - 10911:10911
+    volumes:
+      - ./broker.conf:/broker.conf
+    environment:
+        NAMESRV_ADDR: "172.101.239.100:9876"
+        JAVA_OPTS: " -Duser.home=/opt"
+        JAVA_OPT_EXT: "-server -Xms128m -Xmx128m -Xmn128m"
+    command: mqbroker -c /broker.conf
+    depends_on:
+      - rocketmq_server
+    networks:
+      rocketmq_test_bridge:
+        ipv4_address: 172.101.239.110
+  rocketmq_console:
+    image: styletang/rocketmq-console-ng
+    container_name: rmqconsole
+    ports:
+      - 18080:8080
+    environment:
+        JAVA_OPTS: "-Drocketmq.namesrv.addr=172.101.239.100:9876 -Dcom.rocketmq.sendMessageWithVIPChannel=false"
+    depends_on:
+      - rocketmq_server
+
+networks:
+  rocketmq_test_bridge:
+    driver: bridge
+    name: rocketmq_test_bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.101.239.0/24
+          gateway: 172.101.239.1
