@@ -129,7 +129,7 @@ handle_response(<<>>, State) ->
 handle_response(Bin, State = #state{requests = Reqs, last_bin = LastBin}) ->
     case rocketmq_protocol_frame:parse(<<LastBin/binary, Bin/binary>>) of
         {undefined, undefined, Bin1} ->
-            {nodelay, State#state{last_bin = Bin1}, hibernate};
+            {noreply, State#state{last_bin = Bin1}, hibernate};
         {Header, Payload, Bin1} ->
             NewReqs = do_response(Header, Payload, Reqs),
             handle_response(Bin1, State#state{requests = NewReqs, last_bin = <<>>})

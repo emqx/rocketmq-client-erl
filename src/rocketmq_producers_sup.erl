@@ -44,7 +44,8 @@ ensure_present(ClientId, ProducerGroup, Topic, ProducerOpts) ->
         {ok, Pid} -> {ok, Pid};
         {error, {already_started, Pid}} -> {ok, Pid};
         {error, {{already_started, Pid}, _}} -> {ok, Pid};
-        {error, already_present} -> {error, not_running}
+        {error, already_present} -> {error, not_running};
+        {error, Reason} -> {error, Reason}
     end.
 
 %% ensure client stopped and deleted under supervisor
