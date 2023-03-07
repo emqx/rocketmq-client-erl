@@ -23,10 +23,15 @@
 -define(SEND_MESSAGE_V2, 310).
 -define(SEND_BATCH_MESSAGE, 320).
 
+%% will be encoded as "\u0001" or "\u0002" by jsonr:encode/1 before sending
+-define(NAME_VALUE_SEPARATOR, 1).
+-define(PROPERTY_SEPARATOR, 2).
+
 -export([ get_routeinfo_by_topic/4
         , send_message_v2/7
         , send_batch_message_v2/7
         , heart_beat/4
+        , make_produce_props/1
         ]).
 
 -export([parse/1]).
@@ -202,3 +207,18 @@ message_fixed_headers(Namespace) ->
      {<<"j">>, 0},
      {<<"k">>, <<"false">>}
     ].
+
+make_produce_props(Context) when is_map(Context) ->
+    do_make_produce_props(maps:to_list(Context), <<>>).
+
+do_make_produce_props([], ProdContext) ->
+    ProdContext;
+do_make_produce_props([{key, Key} | Context], ProdContext) ->
+    do_make_produce_props(Context, append_property(<<"KEYS">>, Key, ProdContext));
+do_make_produce_props([{tag, Tag} | Context], ProdContext) ->
+    do_make_produce_props(Context, append_property(<<"TAGS">>, Tag, ProdContext)).
+
+append_property(Name, Val, <<>>) ->
+    <<Name/binary, ?NAME_VALUE_SEPARATOR, Val/binary>>;
+append_property(Name, Val, ProdContext) ->
+    <<ProdContext/binary, ?PROPERTY_SEPARATOR, Name/binary, ?NAME_VALUE_SEPARATOR, Val/binary>>.
