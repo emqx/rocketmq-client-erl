@@ -55,10 +55,10 @@ send_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, {Payload, Prop
         ++ single_message_fixed_headers(Namespace),
     serialized(?SEND_MESSAGE_V2, Opaque, ExtFields, Payload, ACLInfo).
 
-send_batch_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, Payloads, ACLInfo) ->
-    ExtFields = basic_ext_headers(ProducerGroup, Namespace, Topic, QueueId, <<>>)
+send_batch_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, [{_, Properties} | _] = PayloadPropsList, ACLInfo) ->
+    ExtFields = basic_ext_headers(ProducerGroup, Namespace, Topic, QueueId, Properties)
         ++ batch_message_fixed_headers(Namespace),
-    serialized(?SEND_BATCH_MESSAGE, Opaque, ExtFields, batch_message(Payloads), ACLInfo).
+    serialized(?SEND_BATCH_MESSAGE, Opaque, ExtFields, batch_message(PayloadPropsList), ACLInfo).
 
 heart_beat(Opaque, ClientID, GroupName, ACLInfo) ->
     Payload = [{<<"clientID">>, ClientID},
@@ -84,19 +84,21 @@ parse(<<Len:32, HeaderLen:32, HeaderData:HeaderLen/binary, Bin/binary>>) ->
 parse(Bin) ->
     {undefined, undefined, Bin}.
 
-batch_message(Payloads) ->
-    batch_message(Payloads, <<>>).
+batch_message(PayloadPropsList) ->
+    batch_message(PayloadPropsList, <<>>).
 batch_message([], Acc) ->
     Acc;
 batch_message([{Payload, Properties} | Payloads], Acc) ->
+    %% https://github.com/apache/rocketmq/blob/06f2208a34907211591114f6b0d327168c250fb3/common/src/main/java/org/apache/rocketmq/common/message/MessageDecoder.java#L517
     MagicCode = 0,
-    Crc = 0,
-    PayloadLen = size(Payload),
+    CRC = 0,
     Flag = 0,
+    BodyLen = size(Payload),
     PropertiesLen = size(Properties),
-    Len = 18 + PayloadLen + size(Properties),
-    NewAcc = <<Acc/binary, Len:32, MagicCode:32, Crc:32, Flag:32,
-      PayloadLen:32, Payload/binary, PropertiesLen:16>>,
+    %% MagicCode(4) + CRC(4) + Flag(4) + BodyLen(4) + PropertiesLen(2) = 18,
+    Len = 18 + BodyLen + size(Properties),
+    NewAcc = <<Acc/binary, Len:32, MagicCode:32, CRC:32, Flag:32,
+      BodyLen:32, Payload/binary, PropertiesLen:16, Properties/binary>>,
     batch_message(Payloads, NewAcc).
 
 serialized(Code, Opaque, Payload, ACLInfo) ->
