@@ -138,9 +138,9 @@ connected(cast, {send, MsgAndProps}, State = #state{sock = Sock,
                 _ = send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgAndProps, get_acl_info(ProducerOpts)),
                 1;
             false ->
-                Messages = [MsgAndProps | collect_send_calls(BatchSize)],
-                _ = batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, Messages, get_acl_info(ProducerOpts)),
-                erlang:length(Messages)
+                MsgPropsList = [MsgAndProps | collect_send_calls(BatchSize)],
+                _ = batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgPropsList, get_acl_info(ProducerOpts)),
+                erlang:length(MsgPropsList)
         end,
     NRequests = maps:put(Opaque, {batch_len, BatchLen}, Requests),
     NState = next_opaque_id(State),
