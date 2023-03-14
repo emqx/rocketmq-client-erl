@@ -87,9 +87,11 @@ fast_get_context(_) ->
     #{}.
 
 normalize_batch_messages(Messages) ->
-    lists:map(fun({Bin, _Context}) ->
-                      {Bin, <<>>};
+    lists:map(fun({Bin, Context}) ->
+                      Props = rocketmq_protocol_frame:make_produce_props(Context),
+                      {Bin, Props};
                  (Bin) ->
-                      {Bin, <<>>}
+                      Props = rocketmq_protocol_frame:make_produce_props(#{}),
+                      {Bin, Props}
               end,
               Messages).
