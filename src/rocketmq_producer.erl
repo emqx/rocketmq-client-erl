@@ -133,7 +133,7 @@ connected(cast, {send, MsgAndProps}, State = #state{sock = Sock,
                                                 requests = Requests
                                                 }) ->
     BatchLen =
-        case BatchSize =:= 0 of
+        case BatchSize =< 1 of
             true ->
                 _ = send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgAndProps, get_acl_info(ProducerOpts)),
                 1;
