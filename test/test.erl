@@ -33,6 +33,8 @@ start() ->
     io:format("send async ~p~n", [SSendRes]),
     SSendRes2 = rocketmq:send(Producers, <<"hello, form sdk">>),
     io:format("send2 async ~p~n", [SSendRes2]),
+
+    ok = rocketmq:batch_send_sync(Producers, [<<"hello">>, <<"form">>, <<"sdk">>], 10000),
     ok.
 
 callback(Code, Topic, Size) ->
