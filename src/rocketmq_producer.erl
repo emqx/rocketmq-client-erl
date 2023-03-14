@@ -66,14 +66,14 @@ callback_mode() -> [state_functions].
 start_link(QueueId, Topic, Server, ProducerGroup, ProducerOpts) ->
     gen_statem:start_link(?MODULE, [QueueId, Topic, Server, ProducerGroup, ProducerOpts], []).
 
-send(Pid, Message) ->
-    gen_statem:cast(Pid, {send, Message}).
+send(Pid, MsgAndProps) ->
+    gen_statem:cast(Pid, {send, MsgAndProps}).
 
-send_sync(Pid, Message) ->
-    send_sync(Pid, Message, 5000).
+send_sync(Pid, MsgAndProps) ->
+    send_sync(Pid, MsgAndProps, 5000).
 
-send_sync(Pid, Message, Timeout) ->
-    gen_statem:call(Pid, {send, Message}, Timeout).
+send_sync(Pid, MsgAndProps, Timeout) ->
+    gen_statem:call(Pid, {send, MsgAndProps}, Timeout).
 
 batch_send_sync(Pid, Messages) ->
     batch_send_sync(Pid, Messages, 5000).
@@ -120,7 +120,7 @@ connected(_EventType, {tcp_closed, Sock}, State = #state{sock = Sock}) ->
 connected(_EventType, {tcp, _, Bin}, State) ->
     handle_response(Bin, State);
 
-connected({call, From}, {send, Message}, State = #state{sock = Sock,
+connected({call, From}, {send, MsgAndProps}, State = #state{sock = Sock,
                                                         topic = Topic,
                                                         queue_id = QueueId,
                                                         producer_group = ProducerGroup,
@@ -128,7 +128,7 @@ connected({call, From}, {send, Message}, State = #state{sock = Sock,
                                                         requests = Reqs,
                                                         producer_opts = ProducerOpts
                                                         }) ->
-    send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, {Message, <<>>}, get_acl_info(ProducerOpts)),
+    send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgAndProps, get_acl_info(ProducerOpts)),
     {keep_state, next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)})};
 
 connected({call, From}, {batch_send, Messages}, State = #state{sock = Sock,
@@ -142,7 +142,7 @@ connected({call, From}, {batch_send, Messages}, State = #state{sock = Sock,
     batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, Messages, get_acl_info(ProducerOpts)),
     {keep_state, next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)})};
 
-connected(cast, {send, Message}, State = #state{sock = Sock,
+connected(cast, {send, MsgAndProps}, State = #state{sock = Sock,
                                                 topic = Topic,
                                                 queue_id = QueueId,
                                                 producer_group = ProducerGroup,
@@ -152,14 +152,14 @@ connected(cast, {send, Message}, State = #state{sock = Sock,
                                                 requests = Requests
                                                 }) ->
     BatchLen =
-        case BatchSize =:= 0 of
+        case BatchSize =< 1 of
             true ->
-                _ = send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, {Message, <<>>}, get_acl_info(ProducerOpts)),
+                _ = send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgAndProps, get_acl_info(ProducerOpts)),
                 1;
             false ->
-                Messages = [{Message, <<>>} | collect_send_calls(BatchSize)],
-                _ = batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, Messages, get_acl_info(ProducerOpts)),
-                erlang:length(Messages)
+                MsgPropsList = [MsgAndProps | collect_send_calls(BatchSize)],
+                _ = batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgPropsList, get_acl_info(ProducerOpts)),
+                erlang:length(MsgPropsList)
         end,
     NRequests = maps:put(Opaque, {batch_len, BatchLen}, Requests),
     NState = next_opaque_id(State),
@@ -241,12 +241,12 @@ ping(Sock, ProducerGroup, Opaque, ACLInfo) ->
     gen_tcp:send(Sock, Package),
     start_keepalive().
 
-send(Sock, ProducerGroup, Namespace, Topic, Opaque, QueueId, Message, ACLInfo) ->
-    Package = rocketmq_protocol_frame:send_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, Message, ACLInfo),
+send(Sock, ProducerGroup, Namespace, Topic, Opaque, QueueId, MsgAndProps, ACLInfo) ->
+    Package = rocketmq_protocol_frame:send_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, MsgAndProps, ACLInfo),
     gen_tcp:send(Sock, Package).
 
-batch_send(Sock, ProducerGroup, Namespace, Topic, Opaque, QueueId, Messages, ACLInfo) ->
-    Package = rocketmq_protocol_frame:send_batch_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, Messages, ACLInfo),
+batch_send(Sock, ProducerGroup, Namespace, Topic, Opaque, QueueId, MsgAndPropsList, ACLInfo) ->
+    Package = rocketmq_protocol_frame:send_batch_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, MsgAndPropsList, ACLInfo),
     gen_tcp:send(Sock, Package).
 
 
@@ -260,8 +260,8 @@ collect_send_calls(0, Acc) ->
 
 collect_send_calls(Cnt, Acc) ->
     receive
-        {'$gen_cast', {send, Message}} ->
-            collect_send_calls(Cnt - 1,  [{Message, <<>>} | Acc])
+        {'$gen_cast', {send, MsgAndProps}} ->
+            collect_send_calls(Cnt - 1,  [MsgAndProps | Acc])
     after 0 ->
           lists:reverse(Acc)
     end.

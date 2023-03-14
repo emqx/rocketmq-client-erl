@@ -59,7 +59,8 @@ send(Producers, Message) when is_binary(Message) ->
     send(Producers, {Message, _Context = #{}});
 send(Producers, {Message, Context}) when is_map(Context) ->
     {_Partition, ProducerPid} = rocketmq_producers:pick_producer(Producers, Context),
-    rocketmq_producer:send(ProducerPid, Message).
+    Props = rocketmq_protocol_frame:make_produce_props(Context),
+    rocketmq_producer:send(ProducerPid, {Message, Props}).
 
 -spec send_sync(rocketmq_producers:producers(),
                 binary() | {binary(), rocketmq_producers:produce_context()},
@@ -68,7 +69,8 @@ send_sync(Producers, Message, Timeout) when is_binary(Message) ->
     send_sync(Producers, {Message, _Context = #{}}, Timeout);
 send_sync(Producers, {Message, Context}, Timeout) when is_map(Context) ->
     {_Partition, ProducerPid} = rocketmq_producers:pick_producer(Producers, Context),
-    rocketmq_producer:send_sync(ProducerPid, Message, Timeout).
+    Props = rocketmq_protocol_frame:make_produce_props(Context),
+    rocketmq_producer:send_sync(ProducerPid, {Message, Props}, Timeout).
 
 -spec batch_send_sync(rocketmq_producers:producers(),
                 list(binary() | {binary(), rocketmq_producers:produce_context()}),
@@ -85,9 +87,11 @@ fast_get_context(_) ->
     #{}.
 
 normalize_batch_messages(Messages) ->
-    lists:map(fun({Bin, _Context}) ->
-                      {Bin, <<>>};
+    lists:map(fun({Bin, Context}) ->
+                      Props = rocketmq_protocol_frame:make_produce_props(Context),
+                      {Bin, Props};
                  (Bin) ->
-                      {Bin, <<>>}
+                      Props = rocketmq_protocol_frame:make_produce_props(#{}),
+                      {Bin, Props}
               end,
               Messages).
