@@ -37,6 +37,11 @@
         , pick_producer/2
         ]).
 
+-ifdef(TEST).
+-export([ get_delta_broker_datas/2
+        ]).
+-endif.
+
 -record(state, {topic,
                 client_id,
                 workers,
@@ -154,6 +159,8 @@ start_link(ClientId, ProducerGroup, Topic, ProducerOpts) ->
     gen_server:start_link({local, get_name(ProducerOpts)}, ?MODULE, [ClientId, ProducerGroup, Topic, ProducerOpts], []).
 
 init([ClientId, ProducerGroup, Topic, ProducerOpts]) ->
+    logger:debug("start producer manager for topic: ~p, clientid: ~p, producer_group: ~p",
+        [Topic, ClientId, ProducerGroup]),
     erlang:process_flag(trap_exit, true),
     RefTopicRouteInterval = maps:get(ref_topic_route_interval, ProducerOpts, 5000),
     erlang:send_after(RefTopicRouteInterval, self(), ref_topic_route),
@@ -195,16 +202,26 @@ handle_call(_Call, _From, State) ->
 handle_cast(_Cast, State) ->
     {noreply, State}.
 
-handle_info({'EXIT', Pid, _Error}, State = #state{workers = Workers, producers = Producers, producer_opts = ProducerOpts}) ->
+handle_info({'EXIT', Pid, Error}, State = #state{workers = Workers, producers = Producers,
+                                                 broker_datas = BrokerDatas, producer_opts = ProducerOpts}) ->
     case maps:get(Pid, Producers, undefined) of
         undefined ->
-            log_error("Not find Pid:~p producer", [Pid]),
+            logger:error("Got EXIT from unknown pid: ~p, error: ~p", [Pid, Error]),
             {noreply, State};
         {BrokerAddrs, QueueNum} ->
-            ets:delete(Workers, QueueNum),
-            RestartAfter = maps:get(producer_restart_interval, ProducerOpts, ?RESTART_INTERVAL),
-            erlang:send_after(RestartAfter, self(), {start_producer, BrokerAddrs, QueueNum}),
-            {noreply, State#state{producers = maps:remove(Pid, Producers)}}
+            case first_broker_addr_exists(maps:get(<<"0">>, BrokerAddrs, not_found), BrokerDatas) of
+                true ->
+                    ets:delete(Workers, QueueNum),
+                    RestartAfter = maps:get(producer_restart_interval, ProducerOpts, ?RESTART_INTERVAL),
+                    erlang:send_after(RestartAfter, self(), {start_producer, BrokerAddrs, QueueNum}),
+                    logger:warning("Producer closed with error: ~p, try to restart a new producer. broker_addrs: ~p, queue_num: ~p",
+                        [Error, BrokerAddrs, QueueNum]),
+                    {noreply, State#state{producers = maps:remove(Pid, Producers)}};
+                false ->
+                    logger:warning("Producer closed with error: ~p, don't restart it as it has been removed from the broker_datas. broker_addrs: ~p",
+                        [Error, BrokerAddrs]),
+                    {noreply, State}
+            end
     end;
 
 handle_info({start_producer, BrokerAddrs, QueueSeq}, State = #state{producers = Producers}) ->
@@ -223,20 +240,22 @@ handle_info(ref_topic_route, State = #state{client_id = ClientId,
             case rocketmq_client:get_routeinfo_by_topic(Pid, Topic) of
                 {ok, {_, undefined}} ->
                     {noreply, State};
-                {ok, {_, Payload}} ->
-                    BrokerDatas1 = lists:sort(maps:get(<<"brokerDatas">>, Payload, [])),
-                    case BrokerDatas1 -- lists:sort(BrokerDatas) of
+                {ok, {_, RouteInfo}} ->
+                    BrokerDatas1 = maps:get(<<"brokerDatas">>, RouteInfo, []),
+                    case get_delta_broker_datas(BrokerDatas, BrokerDatas1) of
                         [] -> {noreply, State};
-                        BrokerDatas2 ->
-                            QueueDatas = maps:get(<<"queueDatas">>, Payload, []),
-                            {NewQueueNums, NewProducers} = start_producer(QueueNums, BrokerDatas2, QueueDatas, Producers, State),
+                        DeltaBrokerData ->
+                            QueueDatas = maps:get(<<"queueDatas">>, RouteInfo, []),
+                            logger:warning("Start new producers for new topic route, delta broker_data: ~p, queue_nums: ~p",
+                                [DeltaBrokerData, QueueNums]),
+                            {NewQueueNums, NewProducers} = start_producer(QueueNums, DeltaBrokerData, QueueDatas, Producers, State),
                             ets:insert(rocketmq_topic, {Topic, NewQueueNums}),
                             {noreply, State#state{queue_nums = NewQueueNums,
                                                 producers = NewProducers,
                                                 broker_datas = BrokerDatas1}}
                     end;
                 {error, Reason} ->
-                    log_error("Get routeinfo by topic failed: ~p", [Reason]),
+                    logger:error("Get routeinfo by topic failed: ~p", [Reason]),
                     {noreply, State}
                 end;
         {error, Reason} ->
@@ -244,7 +263,7 @@ handle_info(ref_topic_route, State = #state{client_id = ClientId,
     end;
 
 handle_info(_Info, State) ->
-    log_error("Receive unknown message:~p~n", [_Info]),
+    logger:error("Receive unknown message:~p~n", [_Info]),
     {noreply, State}.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -253,9 +272,6 @@ code_change(_OldVsn, State, _Extra) ->
 terminate(_, _St) -> ok.
 
 get_name(ProducerOpts) -> maps:get(name, ProducerOpts, ?MODULE).
-
-log_error(Fmt, Args) ->
-    error_logger:error_msg(Fmt, Args).
 
 maybe_start_producer(Pid, State = #state{topic = Topic, producers = Producers}) ->
     case rocketmq_client:get_routeinfo_by_topic(Pid, Topic) of
@@ -268,20 +284,20 @@ maybe_start_producer(Pid, State = #state{topic = Topic, producers = Producers}) 
         {ok, {_, RouteInfo}} ->
             start_producer_with_route_info(RouteInfo, Producers, State);
         {error, Reason} ->
-            log_error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, Topic]),
+            logger:error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, Topic]),
             {error, {get_routeinfo_by_topic_failed, Reason}}
     end.
 
 maybe_start_producer_using_default_topic(Pid, State = #state{producers = Producers}) ->
     case rocketmq_client:get_routeinfo_by_topic(Pid, ?DEFAULT_TOPIC) of
         {ok, {Header, undefined}} ->
-            log_error("Start producer failed, remark: ~p",
+            logger:error("Start producer failed, remark: ~p",
                 [maps:get(<<"remark">>, Header, undefined)]),
             {error, {start_producer_failed, Header}};
         {ok, {_, RouteInfo}} ->
             start_producer_with_route_info(RouteInfo, Producers, State);
         {error, Reason} ->
-            log_error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, ?DEFAULT_TOPIC]),
+            logger:error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, ?DEFAULT_TOPIC]),
             {error, {get_routeinfo_by_topic_failed, Reason}}
     end.
 
@@ -307,7 +323,7 @@ start_producer(Start, BrokerDatas,  QueueDatas, Producers, State = #state{topic 
         QueueData = find_queue_data(BrokerName, QueueDatas),
         case maps:get(<<"perm">>, QueueData) =:= 4 of
             true ->
-                log_error("Start producer fail; topic: ~p; permission denied", [Topic]),
+                logger:error("Start producer fail; topic: ~p; permission denied", [Topic]),
                 {QueueNumAcc, ProducersAcc};
             false ->
                 QueueNum = maps:get(<<"writeQueueNums">>, QueueData),
@@ -324,6 +340,7 @@ do_start_producer(BrokerAddrs, QueueSeq, Producers, #state{workers = Workers,
                                                         producer_group = ProducerGroup,
                                                         producer_opts = ProducerOpts}) ->
     Server = maps:get(<<"0">>, BrokerAddrs),
+    logger:notice("Start producer for topic: ~p, broker_addr: ~p", [Topic, Server]),
     {ok, Producer} = rocketmq_producer:start_link(QueueSeq, Topic, Server, ProducerGroup, ProducerOpts),
     ets:insert(Workers, {QueueSeq, Producer}),
     maps:put(Producer, {BrokerAddrs, QueueSeq}, Producers).
@@ -333,3 +350,20 @@ ensure_ets_created(TabName) ->
     catch
         error:badarg -> TabName %% already exists
     end.
+
+get_delta_broker_datas(OldDatas, NewDatas) ->
+    lists:foldl(fun
+            (#{<<"brokerAddrs">> := #{<<"0">> := FirstAddr}} = NewD, Acc) ->
+                Acc ++ [NewD || not first_broker_addr_exists(FirstAddr, OldDatas)];
+            (_, Acc) ->
+                Acc
+        end, [], NewDatas).
+
+first_broker_addr_exists(Addr, Datas) ->
+    Res = lists:search(fun
+            (#{<<"brokerAddrs">> := #{<<"0">> := FirstAddr}}) ->
+                FirstAddr =:= Addr;
+            (_) ->
+                false
+        end, Datas),
+    Res =/= false.
