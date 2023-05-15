@@ -34,7 +34,7 @@ spawn_producers(#{workers := Workers, queue_nums := QueueCount}) ->
     lists:map(
      fun(N) ->
        Pid = spawn_link(fun() -> receive die -> ok end end),
-       true = ets:insert(Workers, {N, Pid}),
+       true = ets:insert(Workers, {N, <<"broker-name-1">>, N, Pid}),
        Pid
      end,
      lists:seq(0, QueueCount - 1)).

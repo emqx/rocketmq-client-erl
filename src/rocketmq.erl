@@ -57,7 +57,7 @@ stop_and_delete_supervised_producers(Producers) ->
 send(Producers, Message) when is_binary(Message) ->
     send(Producers, {Message, _Context = #{}});
 send(Producers, {Message, Context}) when is_map(Context) ->
-    {_Partition, ProducerPid} = rocketmq_producers:pick_producer(Producers, Context),
+    {_Index, ProducerPid} = rocketmq_producers:pick_producer(Producers, Context),
     Props = rocketmq_protocol_frame:make_produce_props(Context),
     rocketmq_producer:send(ProducerPid, {Message, Props}).
 
@@ -67,6 +67,6 @@ send(Producers, {Message, Context}) when is_map(Context) ->
 send_sync(Producers, Message, Timeout) when is_binary(Message) ->
     send_sync(Producers, {Message, _Context = #{}}, Timeout);
 send_sync(Producers, {Message, Context}, Timeout) when is_map(Context) ->
-    {_Partition, ProducerPid} = rocketmq_producers:pick_producer(Producers, Context),
+    {_Index, ProducerPid} = rocketmq_producers:pick_producer(Producers, Context),
     Props = rocketmq_protocol_frame:make_produce_props(Context),
     rocketmq_producer:send_sync(ProducerPid, {Message, Props}, Timeout).
