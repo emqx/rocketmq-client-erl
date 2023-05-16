@@ -39,15 +39,20 @@
 
 -ifdef(TEST).
 -export([ get_delta_broker_datas/2
+        , producer_defragmentation/1
+        , insert_producer/5
+        , get_producer_pid/2
+        , lookup_producer/2
+        , producer_count/1
+        , delete_producer/2
         ]).
 -endif.
 
 -record(state, {topic,
                 client_id,
                 workers,
-                queue_nums,
                 producer_opts,
-                producers = #{},
+                producers_ref = #{},
                 producer_group,
                 broker_datas,
                 ref_topic_route_interval = 5000}).
@@ -74,8 +79,8 @@
              , produce_context/0
              ]).
 
--define(PRODUCER_INFO(INDEX, BORKER_NAME, BROKER_ADDR, QUEUE_SEQ_NUM), #{tab_index => INDEX, broker_name => BORKER_NAME, broker_addr => BROKER_ADDR, queue_seq_num => QUEUE_SEQ_NUM}).
--define(M_PRODUCER_INFO(INDEX, BORKER_NAME, BROKER_ADDR, QUEUE_SEQ_NUM), #{tab_index := INDEX, broker_name := BORKER_NAME, broker_addr := BROKER_ADDR, queue_seq_num := QUEUE_SEQ_NUM}).
+-define(PRODUCER_INFO(INDEX, BORKER_NAME, QUEUE_SEQ_NUM, PID, BROKER_ADDR),
+    {INDEX, BORKER_NAME, QUEUE_SEQ_NUM, PID, BROKER_ADDR}).
 
 -spec start_supervised(clientid(), producer_group(), topic(), producer_opts()) -> {ok, producers()}.
 start_supervised(ClientId, ProducerGroup, Topic, ProducerOpts) ->
@@ -99,12 +104,12 @@ pick_producer(Producers) ->
 pick_producer(Producers = #{workers := WorkersTab, topic := Topic},
               Context = #{}) ->
     Partitioner = maps:get(partitioner, Producers, roundrobin),
-    QueueCount = producer_queue_count(WorkersTab),
+    QueueCount = producer_count(WorkersTab),
     Index = pick_index(Partitioner, QueueCount, Topic, Context),
     do_pick_producer(Index, QueueCount, WorkersTab).
 
 do_pick_producer(Index, QueueCount, WorkersTab) ->
-    Pid0 = lookup_producer(WorkersTab, Index),
+    Pid0 = get_producer_pid(WorkersTab, Index),
     case is_pid(Pid0) andalso is_process_alive(Pid0) of
         true -> {Index, Pid0};
         false ->
@@ -119,7 +124,7 @@ pick_next_alive(WorkersTab, Index, QueueCount) ->
 pick_next_alive(_Workers, _Index, QueueCount, QueueCount) ->
     erlang:error(all_producers_down);
 pick_next_alive(WorkersTab, Index, QueueCount, Tried) ->
-    case lookup_producer(WorkersTab, Index) of
+    case get_producer_pid(WorkersTab, Index) of
         {error, _} ->
             pick_next_alive(WorkersTab, (Index + 1) rem QueueCount, QueueCount, Tried + 1);
         Pid ->
@@ -131,17 +136,57 @@ pick_next_alive(WorkersTab, Index, QueueCount, Tried) ->
 
 is_alive(Pid) -> is_pid(Pid) andalso is_process_alive(Pid).
 
-producer_queue_count(WorkersTab) ->
+producer_count(WorkersTab) ->
     case ets:info(WorkersTab, size) of
         undefined -> throw({ets_table_not_found, WorkersTab});
         Count -> Count
     end.
 
+get_producer_pid(WorkersTab, Index) ->
+    case lookup_producer(WorkersTab, Index) of
+        {ok, ?PRODUCER_INFO(_TabIndex, _BrokerName, _QueueSeqNum, Pid, _BrokerAddrs)} -> Pid;
+        {error, _} = Err -> Err
+    end.
+
 lookup_producer(WorkersTab, Index) ->
     case ets:lookup(WorkersTab, Index) of
         [] -> {error, get_worker_fail};
-        [{_TabIndex, _BrokerName, _QueueSeqNum, Pid}] -> Pid
+        [Producer] -> {ok, Producer}
     end.
+
+insert_producer(WorkersTab, TabIndex, BrokerName, QueueSeqNum, Pid, BrokerAddrs) ->
+    ets:insert(WorkersTab, ?PRODUCER_INFO(TabIndex, BrokerName, QueueSeqNum, Pid, BrokerAddrs)).
+
+delete_producer(WorkersTab, TabIndex) ->
+    ets:delete(WorkersTab, TabIndex).
+
+delete_producer_by_pid(WorkersTab, Pid) ->
+    ets:match_delete(WorkersTab, ?PRODUCER_INFO('_', '_', '_', Pid, '_')).
+
+make_producers_ref(WorkersTab) ->
+    lists:foldl(fun({TabIndex, _, _, Pid, _}, RefMap) ->
+            case is_alive(Pid) of
+                true -> RefMap#{Pid => TabIndex};
+                false -> RefMap
+            end
+        end, #{}, ets:tab2list(WorkersTab)).
+
+%% [0,1,3,4,6] -> [0,1,2,3,4]
+producer_defragmentation(WorkersTab) ->
+    producer_defragmentation(WorkersTab, ets:first(WorkersTab), 0).
+
+producer_defragmentation(_WorkersTab, '$end_of_table', _Index) ->
+    ok;
+producer_defragmentation(WorkersTab, TabIndex, Index) when TabIndex == Index ->
+    producer_defragmentation(WorkersTab, ets:next(WorkersTab, TabIndex), Index + 1);
+producer_defragmentation(WorkersTab, TabIndex, Index) when TabIndex > Index ->
+    move_producer_to_new_index(WorkersTab, TabIndex, Index),
+    producer_defragmentation(WorkersTab, ets:next(WorkersTab, TabIndex), Index + 1).
+
+move_producer_to_new_index(WorkersTab, TabIndex, NewIndex) ->
+    {ok, ?PRODUCER_INFO(_, BrokerName, QueueSeqNum, Pid, BrokerAddrs)} = lookup_producer(WorkersTab, TabIndex),
+    delete_producer(WorkersTab, TabIndex),
+    insert_producer(WorkersTab, NewIndex, BrokerName, QueueSeqNum, Pid, BrokerAddrs).
 
 -spec pick_index(partitioner(), queue_count(), topic(), produce_context()) -> index().
 pick_index(roundrobin, QueueCount, _Topic, _Context) ->
@@ -162,7 +207,7 @@ init([ClientId, ProducerGroup, Topic, ProducerOpts]) ->
         [Topic, ClientId, ProducerGroup]),
     erlang:process_flag(trap_exit, true),
     RefTopicRouteInterval = maps:get(ref_topic_route_interval, ProducerOpts, 5000),
-    erlang:send_after(RefTopicRouteInterval, self(), ref_topic_route),
+    erlang:send_after(RefTopicRouteInterval, self(), refresh_topic_route),
     State = #state{
         topic = Topic,
         client_id = ClientId,
@@ -176,14 +221,13 @@ init([ClientId, ProducerGroup, Topic, ProducerOpts]) ->
         {error, Reason} -> {stop, {shutdown, Reason}}
     end.
 
-init_producers(ClientId, State) ->
+init_producers(ClientId, State = #state{workers = WorkersTab}) ->
     case rocketmq_client_sup:find_client(ClientId) of
         {ok, Pid} ->
             case maybe_start_producer(Pid, State) of
-                {ok, {QueueNums, NewProducers, BrokerDatas}} ->
+                {ok, BrokerDatas} ->
                     {ok, State#state{
-                            queue_nums = QueueNums,
-                            producers = NewProducers,
+                            producers_ref = make_producers_ref(WorkersTab),
                             broker_datas = BrokerDatas}};
                 {error, Reason} ->
                     {error, Reason}
@@ -201,56 +245,70 @@ handle_call(_Call, _From, State) ->
 handle_cast(_Cast, State) ->
     {noreply, State}.
 
-handle_info({'EXIT', Pid, Error}, State = #state{workers = WorkersTab, producers = Producers,
-                                                 broker_datas = BrokerDatas, producer_opts = ProducerOpts}) ->
-    case maps:get(Pid, Producers, undefined) of
+handle_info({'EXIT', Pid, Reason}, State = #state{
+        workers = WorkersTab, producers_ref = ProducersRef,
+        broker_datas = BrokerDatas, producer_opts = ProducerOpts}) ->
+    case maps:get(Pid, ProducersRef, undefined) of
         undefined ->
-            logger:error("Got EXIT from unknown pid: ~p, error: ~p", [Pid, Error]),
-            {noreply, State};
-        ?M_PRODUCER_INFO(Index, _, BrokerAddrs, QueueSeqNum) = ProducerInfo->
-            case first_broker_addr_exists(maps:get(<<"0">>, BrokerAddrs, not_found), BrokerDatas) of
-                true ->
-                    ets:delete(WorkersTab, Index),
-                    RestartAfter = maps:get(producer_restart_interval, ProducerOpts, ?RESTART_INTERVAL),
-                    erlang:send_after(RestartAfter, self(), {start_producer, ProducerInfo}),
-                    logger:warning("Producer closed with error: ~p, try to restart a new producer. broker_addrs: ~p, queue_num: ~p",
-                        [Error, BrokerAddrs, QueueSeqNum]),
-                    {noreply, State#state{producers = maps:remove(Pid, Producers)}};
-                false ->
-                    logger:warning("Producer closed with error: ~p, don't restart it as it has been removed from the broker_datas. broker_addrs: ~p",
-                        [Error, BrokerAddrs]),
-                    {noreply, State}
+            delete_producer_by_pid(WorkersTab, Pid),
+            producer_defragmentation(WorkersTab),
+            {noreply, State#state{producers_ref = make_producers_ref(WorkersTab)}};
+        TabIndex ->
+            case lookup_producer(WorkersTab, TabIndex) of
+                {error, _} = Err ->
+                    logger:error("Producer closed with error: ~p, but lookup producer failed: ~p, index: ~p", [Reason, Err, TabIndex]),
+                    {noreply, State#state{producers_ref = maps:remove(Pid, ProducersRef)}};
+                {ok, ?PRODUCER_INFO(_, BrokerName, QueueSeqNum, _Pid, BrokerAddrs) = ProducerInfo} ->
+                    case first_broker_addr_exists(maps:get(<<"0">>, BrokerAddrs, not_found), BrokerDatas) of
+                        true ->
+                            %% In case that the producer is disconnected but the broker has not been
+                            %% removed by peer, we don't remove the producer to avoid reshuffle the key.
+                            insert_producer(WorkersTab, TabIndex, BrokerName, QueueSeqNum, dead, BrokerAddrs),
+                            RestartAfter = maps:get(producer_restart_interval, ProducerOpts, ?RESTART_INTERVAL),
+                            erlang:send_after(RestartAfter, self(), {start_producer, ProducerInfo}),
+                            logger:warning("Producer closed with error: ~p, try to restart a new producer. broker_addrs: ~p, queue_num: ~p",
+                                [Reason, BrokerAddrs, QueueSeqNum]),
+                            {noreply, State#state{producers_ref = maps:remove(Pid, ProducersRef)}};
+                        false ->
+                            delete_producer(WorkersTab, TabIndex),
+                            logger:warning("Producer closed with error: ~p, don't restart it as it has been removed from the broker_datas. broker_addrs: ~p",
+                                [Reason, BrokerAddrs]),
+                            producer_defragmentation(WorkersTab),
+                            {noreply, State#state{
+                                producers_ref = make_producers_ref(WorkersTab)
+                            }}
+                    end
             end
     end;
 
-handle_info({start_producer, ?M_PRODUCER_INFO(TabIndex, BrokerName, BrokerAddrs, QueueSeqNum)}, State = #state{producers = Producers}) ->
-    NewProducers = do_start_producer(TabIndex, BrokerName, BrokerAddrs, QueueSeqNum, Producers, State),
-    {noreply, State#state{producers = NewProducers}};
+handle_info({start_producer, ?PRODUCER_INFO(TabIndex, BrokerName, QueueSeqNum, _, BrokerAddrs)}, State = #state{workers = WorkersTab}) ->
+    do_start_producer(TabIndex, BrokerName, BrokerAddrs, QueueSeqNum, State),
+    {noreply, State#state{producers_ref = make_producers_ref(WorkersTab)}};
 
-handle_info(ref_topic_route, State = #state{client_id = ClientId,
-                                            topic = Topic,
-                                            queue_nums = QueueNums,
-                                            broker_datas = BrokerDatas,
-                                            producers = Producers,
-                                            ref_topic_route_interval = RefTopicRouteInterval}) ->
+handle_info(refresh_topic_route, State = #state{
+        client_id = ClientId,
+        topic = Topic,
+        broker_datas = OldBrokerDatas,
+        workers = WorkersTab,
+        ref_topic_route_interval = RefTopicRouteInterval}) ->
     case rocketmq_client_sup:find_client(ClientId) of
         {ok, Pid} ->
-            erlang:send_after(RefTopicRouteInterval, self(), ref_topic_route),
+            erlang:send_after(RefTopicRouteInterval, self(), refresh_topic_route),
             case rocketmq_client:get_routeinfo_by_topic(Pid, Topic) of
                 {ok, {_, undefined}} ->
                     {noreply, State};
                 {ok, {_, RouteInfo}} ->
-                    BrokerDatas1 = maps:get(<<"brokerDatas">>, RouteInfo, []),
-                    case get_delta_broker_datas(BrokerDatas, BrokerDatas1) of
-                        [] -> {noreply, State};
-                        DeltaBrokerData ->
+                    NewBrokerDatas = maps:get(<<"brokerDatas">>, RouteInfo, []),
+                    case {get_delta_broker_datas(OldBrokerDatas, NewBrokerDatas),
+                          get_delta_broker_datas(NewBrokerDatas, OldBrokerDatas)} of
+                        {[], []} -> {noreply, State#state{broker_datas = NewBrokerDatas}};
+                        {NewAdded, Removed} ->
                             QueueDatas = maps:get(<<"queueDatas">>, RouteInfo, []),
-                            logger:warning("Start new producers for new topic route, delta broker_data: ~p, queue_nums: ~p",
-                                [DeltaBrokerData, QueueNums]),
-                            {NewQueueNums, NewProducers} = start_producer(QueueNums, DeltaBrokerData, QueueDatas, Producers, State),
-                            {noreply, State#state{queue_nums = NewQueueNums,
-                                                producers = NewProducers,
-                                                broker_datas = BrokerDatas1}}
+                            start_peer_added_producers(WorkersTab, NewAdded, QueueDatas, State),
+                            stop_peer_removed_producers(WorkersTab, Removed),
+                            {noreply, State#state{
+                                producers_ref = make_producers_ref(WorkersTab),
+                                broker_datas = NewBrokerDatas}}
                     end;
                 {error, Reason} ->
                     logger:error("Get routeinfo by topic failed: ~p", [Reason]),
@@ -271,7 +329,7 @@ terminate(_, _St) -> ok.
 
 get_name(ProducerOpts) -> maps:get(name, ProducerOpts, ?MODULE).
 
-maybe_start_producer(Pid, State = #state{topic = Topic, producers = Producers}) ->
+maybe_start_producer(Pid, State = #state{topic = Topic}) ->
     case rocketmq_client:get_routeinfo_by_topic(Pid, Topic) of
         {ok, {_Header, undefined}} ->
             %% Try again using the default topic, as the 'Topic' does not exists for now.
@@ -280,20 +338,20 @@ maybe_start_producer(Pid, State = #state{topic = Topic, producers = Producers}) 
             %% `autoCreateTopicEnable = true` in the rocketmq server side.
             maybe_start_producer_using_default_topic(Pid, State);
         {ok, {_, RouteInfo}} ->
-            start_producer_with_route_info(RouteInfo, Producers, State);
+            start_producer_with_route_info(RouteInfo, State);
         {error, Reason} ->
             logger:error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, Topic]),
             {error, {get_routeinfo_by_topic_failed, Reason}}
     end.
 
-maybe_start_producer_using_default_topic(Pid, State = #state{producers = Producers}) ->
+maybe_start_producer_using_default_topic(Pid, State) ->
     case rocketmq_client:get_routeinfo_by_topic(Pid, ?DEFAULT_TOPIC) of
         {ok, {Header, undefined}} ->
             logger:error("Start producer failed, remark: ~p",
                 [maps:get(<<"remark">>, Header, undefined)]),
             {error, {start_producer_failed, Header}};
         {ok, {_, RouteInfo}} ->
-            start_producer_with_route_info(RouteInfo, Producers, State);
+            start_producer_with_route_info(RouteInfo, State);
         {error, Reason} ->
             logger:error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, ?DEFAULT_TOPIC]),
             {error, {get_routeinfo_by_topic_failed, Reason}}
@@ -308,43 +366,63 @@ find_queue_data(Key, [QueueData | QueueDatas]) ->
         false -> find_queue_data(Key, QueueDatas)
     end.
 
-start_producer_with_route_info(RouteInfo, Producers, State) ->
+start_producer_with_route_info(RouteInfo, State) ->
     BrokerDatas = maps:get(<<"brokerDatas">>, RouteInfo, []),
     QueueDatas = maps:get(<<"queueDatas">>, RouteInfo, []),
-    {QueueNums, NewProducers} = start_producer(0, BrokerDatas, QueueDatas, Producers, State),
-    {ok, {QueueNums, NewProducers, BrokerDatas}}.
+    _ = start_producer(0, BrokerDatas, QueueDatas, State),
+    {ok, BrokerDatas}.
 
-start_producer(Start, BrokerDatas,  QueueDatas, Producers, State = #state{topic = Topic}) ->
-    lists:foldl(fun(BrokerData, {QueueNumAcc, ProducersAcc}) ->
+start_producer(Start, BrokerDatas, QueueDatas, State = #state{topic = Topic}) ->
+    lists:foldl(fun(BrokerData, QueueNumAcc) ->
         BrokerAddrs = maps:get(<<"brokerAddrs">>, BrokerData),
         BrokerName = maps:get(<<"brokerName">>, BrokerData),
         QueueData = find_queue_data(BrokerName, QueueDatas),
         case maps:get(<<"perm">>, QueueData) =:= 4 of
             true ->
                 logger:error("Start producer fail; topic: ~p; permission denied", [Topic]),
-                {QueueNumAcc, ProducersAcc};
+                QueueNumAcc;
             false ->
                 QueueCount = maps:get(<<"writeQueueNums">>, QueueData),
-                ProducersAcc1 =
-                    lists:foldl(fun(QueueSeqNum, Acc) ->
-                            do_start_producer(QueueNumAcc + QueueSeqNum, BrokerName, BrokerAddrs, QueueSeqNum, Acc, State)
-                        end, ProducersAcc, lists:seq(0, QueueCount - 1)),
-                {QueueNumAcc + QueueCount, ProducersAcc1}
+                lists:foreach(fun(QueueSeqNum) ->
+                        do_start_producer(QueueNumAcc + QueueSeqNum,
+                            BrokerName, BrokerAddrs, QueueSeqNum, State)
+                    end, lists:seq(0, QueueCount - 1)),
+                QueueNumAcc + QueueCount
         end
-    end, {Start, Producers}, BrokerDatas).
+    end, Start, BrokerDatas).
 
-do_start_producer(TabIndex, BrokerName, BrokerAddrs, QueueSeqNum, Producers,
+do_start_producer(TabIndex, BrokerName, BrokerAddrs, QueueSeqNum,
         #state{workers = WorkersTab, topic = Topic,
                producer_group = ProducerGroup,
                producer_opts = ProducerOpts}) ->
     Server = maps:get(<<"0">>, BrokerAddrs),
     logger:notice("Start producer for topic: ~p, broker_addr: ~p", [Topic, Server]),
     {ok, Pid} = rocketmq_producer:start_link(QueueSeqNum, Topic, Server, ProducerGroup, ProducerOpts),
-    ets:insert(WorkersTab, {TabIndex, BrokerName, QueueSeqNum, Pid}),
-    maps:put(Pid, ?PRODUCER_INFO(TabIndex, BrokerName, BrokerAddrs, QueueSeqNum), Producers).
+    insert_producer(WorkersTab, TabIndex, BrokerName, QueueSeqNum, Pid, BrokerAddrs).
+
+start_peer_added_producers(_, [], _, _) ->
+    ok;
+start_peer_added_producers(WorkersTab, NewAdded, QueueDatas, State) ->
+    logger:warning("Start new producers for new topic route, newly added broker_data: ~p", [NewAdded]),
+    ProducerCount = producer_count(WorkersTab),
+    _ = start_producer(ProducerCount, NewAdded, QueueDatas, State),
+    ok.
+
+stop_peer_removed_producers(_, []) ->
+    ok;
+stop_peer_removed_producers(WorkersTab, Removed) ->
+    logger:warning("Stop producers removed by peer: ~p", [Removed]),
+    lists:foreach(fun
+            (#{<<"brokerAddrs">> := #{<<"0">> := Addr}}) ->
+                [gen_statem:stop(Pid, {shutdown, removed_by_peer}, 500)
+                 || ?PRODUCER_INFO(_, _, _, Pid, #{<<"brokerAddrs">> := #{<<"0">> := Addr0}})
+                    <- ets:tab2list(WorkersTab), Addr0 =:= Addr];
+            (_) -> ok
+        end, Removed).
 
 ensure_ets_created(TabName) ->
-    try ets:new(TabName, [protected, named_table, {read_concurrency, true},
+    try ets:new(TabName, [protected, named_table, ordered_set,
+                          {read_concurrency, true},
                           {decentralized_counters, false}])
     catch
         error:badarg -> TabName %% already exists
