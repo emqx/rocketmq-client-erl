@@ -19,7 +19,7 @@
 producers() ->
     QueueCount = 5,
     Partitioner = roundrobin,
-    Workers = ets:new(test_producers, [public]),
+    Workers = ets:new(test_producers, [ordered_set, public]),
     #{ client => clientid
      , topic => <<"topic">>
      , workers => Workers
@@ -31,16 +31,14 @@ setup_topic_table() ->
     catch ets:new(rocketmq_topic, [public, named_table]).
 
 spawn_producers(#{workers := Workers, queue_nums := QueueCount}) ->
+    BrokerAddrs = #{<<"0">> => <<"10.0.0.4:10911">>},
     lists:map(
      fun(N) ->
        Pid = spawn_link(fun() -> receive die -> ok end end),
-       true = ets:insert(Workers, {N, Pid}),
+       true = ets:insert(Workers, {N, <<"broker-name-1">>, N, Pid, BrokerAddrs}),
        Pid
      end,
      lists:seq(0, QueueCount - 1)).
-
-add_topic(#{queue_nums := QueueCount, topic := Topic}) ->
-    true = ets:insert(rocketmq_topic, {Topic, QueueCount}).
 
 kill_producer(Pid) ->
     Ref = monitor(process, Pid),
@@ -53,7 +51,6 @@ kill_producer(Pid) ->
 pick_producer_roundrobin_dead_producer_test() ->
     setup_topic_table(),
     Producers = producers(),
-    add_topic(Producers),
     [Pid0, Pid1, Pid2, Pid3, Pid4] = spawn_producers(Producers),
     kill_producer(Pid0),
     %% it should be 0 and Pid0, if it was alive; queue number is
@@ -79,7 +76,6 @@ pick_producer_key_dispatch_dead_producer_test() ->
     setup_topic_table(),
     Producers0 = producers(),
     Producers = Producers0#{partitioner := key_dispatch},
-    add_topic(Producers),
     [Pid0, Pid1, Pid2, Pid3, Pid4] = spawn_producers(Producers),
 
     ?assertEqual({4, Pid4}, rocketmq_producers:pick_producer(Producers, #{key => <<"k0">>})),
@@ -227,3 +223,45 @@ diff_broker_datas_2_test() ->
     ?assertEqual([#{<<"brokerAddrs">> => #{<<"0">> => b0, <<"1">> => b1}}],
         rocketmq_producers:get_delta_broker_datas(DataA10, DataB10)),
     ok.
+
+producer_defragmentation_test() ->
+    Tab = ets:new(?FUNCTION_NAME, [ordered_set, public]),
+    BrokerAddrs = #{<<"0">> => <<"10.0.0.4:10911">>},
+    [rocketmq_producers:insert_producer(Tab, I, <<"broker-1">>, I, self(), BrokerAddrs)
+     || I <- lists:seq(0, 7)],
+    %% verfiy it's [0,1,2,3,4,5,6,7]
+    [?assertEqual(self(), rocketmq_producers:get_producer_pid(Tab, I))
+     || I <- lists:seq(0, 7)],
+    ?assertEqual(8, rocketmq_producers:producer_count(Tab)),
+
+    rocketmq_producers:delete_producer(Tab, 2),
+    %% verfiy it's [0,1,2,3,4,5,6] after defragmentation
+    ok = rocketmq_producers:producer_defragmentation(Tab),
+    [?assertEqual(self(), rocketmq_producers:get_producer_pid(Tab, I))
+     || I <- lists:seq(0, 6)],
+    ?assertEqual(7, rocketmq_producers:producer_count(Tab)),
+    %% verfiy the producers after index 2 has been moved forward by one position
+    ?assertMatch({ok, {0, _, 0, _, _}}, rocketmq_producers:lookup_producer(Tab, 0)),
+    ?assertMatch({ok, {1, _, 1, _, _}}, rocketmq_producers:lookup_producer(Tab, 1)),
+    [begin
+        SeqN = I + 1,
+        ?assertMatch({ok, {I, _, SeqN, _, _}}, rocketmq_producers:lookup_producer(Tab, I))
+     end || I <- lists:seq(2, 6)],
+
+    rocketmq_producers:delete_producer(Tab, 2),
+    rocketmq_producers:delete_producer(Tab, 3),
+    rocketmq_producers:insert_producer(Tab, 8, <<"broker-1">>, 8, self(), BrokerAddrs),
+    %% verfiy it's [0,1,2,3,4,5] after defragmentation
+    ok = rocketmq_producers:producer_defragmentation(Tab),
+    [?assertEqual(self(), rocketmq_producers:get_producer_pid(Tab, I))
+     || I <- lists:seq(0, 5)],
+    ?assertEqual(6, rocketmq_producers:producer_count(Tab)),
+
+    %% verfiy the producers after index 2 and before index 5 has been moved forward by 3 positions
+    ?assertMatch({ok, {0, _, 0, _, _}}, rocketmq_producers:lookup_producer(Tab, 0)),
+    ?assertMatch({ok, {1, _, 1, _, _}}, rocketmq_producers:lookup_producer(Tab, 1)),
+    [begin
+        SeqN = I + 3,
+        ?assertMatch({ok, {I, _, SeqN, _, _}}, rocketmq_producers:lookup_producer(Tab, I))
+     end || I <- lists:seq(2, 4)],
+    ?assertMatch({ok, {5, _, 8, _, _}}, rocketmq_producers:lookup_producer(Tab, 5)).

@@ -83,7 +83,7 @@ handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = Op
                                                                   }) ->
     case get_sock(Servers, Sock) of
         error ->
-            log_error("Servers: ~p down", [Servers]),
+            log(error, "Servers: ~p down", [Servers]),
             {noreply, State};
         Sock1 ->
             ACLInfo = maps:get(acl_info, Opts, #{}),
@@ -114,7 +114,7 @@ handle_info({tcp_closed, Sock}, State = #state{sock = Sock}) ->
     {noreply, State#state{sock = undefined}, hibernate};
 
 handle_info(_Info, State) ->
-    log_error("RocketMQ client Receive unknown message:~p~n", [_Info]),
+    log(error, "RocketMQ client Receive unknown message:~p~n", [_Info]),
     {noreply, State, hibernate}.
 
 terminate(_Reason, #state{}) ->
@@ -129,7 +129,8 @@ handle_response(<<>>, State) ->
 handle_response(Bin, State = #state{requests = Reqs, last_bin = LastBin}) ->
     case rocketmq_protocol_frame:parse(<<LastBin/binary, Bin/binary>>) of
         {undefined, undefined, Bin1} ->
-            {nodelay, State#state{last_bin = Bin1}, hibernate};
+            log(warning, "Received incomplete message from peer, raw_bin: ~0p", [Bin1]),
+            {noreply, State#state{last_bin = Bin1}, hibernate};
         {Header, Payload, Bin1} ->
             NewReqs = do_response(Header, Payload, Reqs),
             handle_response(Bin1, State#state{requests = NewReqs, last_bin = <<>>})
@@ -167,8 +168,8 @@ try_connect([{Host, Port} | Servers]) ->
             try_connect(Servers)
     end.
 
-log_error(Fmt, Args) ->
-    logger:error("[rocketmq_client]: " ++ Fmt, Args).
+log(Level, Fmt, Args) ->
+    logger:log(Level, "[rocketmq_client]: " ++ Fmt, Args).
 
 next_opaque_id(State = #state{opaque_id = 65535}) ->
     State#state{opaque_id = 1};

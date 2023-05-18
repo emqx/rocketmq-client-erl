@@ -106,7 +106,7 @@ idle(_, connecting, State = #state{opts = Opts, server = Server}) ->
             start_keepalive(),
             {next_state, connected, State#state{sock = Sock}};
         Error ->
-            {stop, Error, State}
+            {stop, {shutdown, Error}, State}
     end;
 
 idle(_, ping, State = #state{sock = undefined}) ->
