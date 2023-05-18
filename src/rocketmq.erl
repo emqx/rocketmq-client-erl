@@ -32,6 +32,7 @@
 %% Messaging APIs
 -export([ send/2
         , send_sync/3
+        , batch_send_sync/3
         ]).
 
 start() ->
@@ -70,3 +71,27 @@ send_sync(Producers, {Message, Context}, Timeout) when is_map(Context) ->
     {_Index, ProducerPid} = rocketmq_producers:pick_producer(Producers, Context),
     Props = rocketmq_protocol_frame:make_produce_props(Context),
     rocketmq_producer:send_sync(ProducerPid, {Message, Props}, Timeout).
+
+-spec batch_send_sync(rocketmq_producers:producers(),
+                list(binary() | {binary(), rocketmq_producers:produce_context()}),
+                timer:time()) -> ok | {error, term()}.
+batch_send_sync(Producers, Messages, Timeout) ->
+    Context = fast_get_context(Messages),
+    Messages2 = normalize_batch_messages(Messages),
+    {_Partition, ProducerPid} = rocketmq_producers:pick_producer(Producers, Context),
+    rocketmq_producer:batch_send_sync(ProducerPid, Messages2, Timeout).
+
+fast_get_context([{_Bin, Context} | _]) ->
+    Context;
+fast_get_context(_) ->
+    #{}.
+
+normalize_batch_messages(Messages) ->
+    lists:map(fun({Bin, Context}) ->
+                      Props = rocketmq_protocol_frame:make_produce_props(Context),
+                      {Bin, Props};
+                 (Bin) ->
+                      Props = rocketmq_protocol_frame:make_produce_props(#{}),
+                      {Bin, Props}
+              end,
+              Messages).

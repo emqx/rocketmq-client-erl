@@ -7,7 +7,7 @@ A Erlang client library for Apache RocketMQ
 
 ```
 application:ensure_all_started(rocketmq),
-{ok, Pid} = rocketmq:ensure_supervised_client('client1', [{"127.0.0.1", 9876}], #{}}),
+{ok, Pid} = rocketmq:ensure_supervised_client('client1', [{"127.0.0.1", 9876}], #{}),
 {ok, Producers} = rocketmq:ensure_supervised_producers('client1', <<"client1_turtle">>, <<"TopicTest">>, #{}),
 ok = rocketmq:send(Producers, <<"hello">>),
 ok = rocketmq:stop_and_delete_supervised_producers(Producers),
@@ -31,6 +31,17 @@ application:ensure_all_started(rocketmq),
 {ok, Pid} = rocketmq:ensure_supervised_client('client1', [{"127.0.0.1", 9876}], #{}),
 {ok, Producers} = rocketmq:ensure_supervised_producers('client1', <<"client1_turtle">>, <<"TopicTest">>, #{}),
 ok = rocketmq:send_sync(Producers, <<"hello">>, 5000),
+ok = rocketmq:stop_and_delete_supervised_producers(Producers),
+ok = rocketmq:stop_and_delete_supervised_client('client1').
+```
+
+### Sync Batch Produce
+
+```
+application:ensure_all_started(rocketmq),
+{ok, Pid} = rocketmq:ensure_supervised_client('client1', [{"127.0.0.1", 9876}], #{}),
+{ok, Producers} = rocketmq:ensure_supervised_producers('client1', <<"client1_turtle">>, <<"TopicTest">>, #{}),
+ok = rocketmq:batch_send_sync(Producers, [<<"hello">>, <<"world">>], 5000),
 ok = rocketmq:stop_and_delete_supervised_producers(Producers),
 ok = rocketmq:stop_and_delete_supervised_client('client1').
 ```
@@ -59,4 +70,4 @@ Apache License Version 2.0
 
 ## Author
 
-EMQ X Team.
+EMQX Team.

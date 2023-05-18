@@ -65,20 +65,20 @@ heart_beat(Opaque, ClientID, GroupName, ACLInfo) ->
                {<<"consumerDataSet">>, []},
                {<<"producerDataSet">>, [[{<<"groupName">>, GroupName}],
                                         [{<<"groupName">>, <<"CLIENT_INNER_PRODUCER">>}]]}],
-    serialized(?HEART_BEAT, Opaque, jsonr:encode(Payload), ACLInfo).
+    serialized(?HEART_BEAT, Opaque, json_encode(Payload), ACLInfo).
 
 
 parse(<<Len:32, HeaderLen:32, HeaderData:HeaderLen/binary, Bin/binary>>) ->
     case Bin == <<>> of
         true ->
-            {jsonr:decode(HeaderData), undefined, Bin};
+            {json_decode(HeaderData), undefined, Bin};
         false ->
             case (Len - 4) - HeaderLen of
                 0 ->
-                    {jsonr:decode(HeaderData), undefined, Bin};
+                    {json_decode(HeaderData), undefined, Bin};
                 PayloadLen ->
                     <<Payload:PayloadLen/binary, Bin1/binary>> = Bin,
-                    {jsonr:decode(HeaderData), jsonr:decode(Payload), Bin1}
+                    {json_decode(HeaderData), json_decode(Payload), Bin1}
             end
     end;
 parse(Bin) ->
@@ -136,7 +136,7 @@ serialized(Code, Opaque, ExtFields, Payload, _ACLInfo) ->
 serialized_(Code, Opaque, Header0, Payload) ->
     Header = [{<<"code">>, Code},
               {<<"opaque">>, Opaque}] ++ Header0 ++ header_base(),
-    HeaderData = jsonr:encode(Header),
+    HeaderData = json_encode(Header),
     HeaderLen = size(HeaderData),
     Len = 4 + HeaderLen + size(Payload),
     <<Len:32, HeaderLen:32, HeaderData/binary, Payload/binary>>.
@@ -209,6 +209,12 @@ message_fixed_headers(Namespace) ->
      {<<"j">>, 0},
      {<<"k">>, <<"false">>}
     ].
+    
+json_encode(Input) ->
+    jsone:encode(Input).
+
+json_decode(Input) ->
+    jsone:decode(Input, [{allow_int_key, true}]).
 
 make_produce_props(Context) when is_map(Context) ->
     do_make_produce_props(maps:to_list(Context), <<>>).

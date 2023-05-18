@@ -19,6 +19,8 @@
 -export([ send/2
         , send_sync/2
         , send_sync/3
+        , batch_send_sync/2
+        , batch_send_sync/3
         ]).
 
 -export([ start_link/5
@@ -73,6 +75,12 @@ send_sync(Pid, MsgAndProps) ->
 send_sync(Pid, MsgAndProps, Timeout) ->
     gen_statem:call(Pid, {send, MsgAndProps}, Timeout).
 
+batch_send_sync(Pid, Messages) ->
+    batch_send_sync(Pid, Messages, 5000).
+
+batch_send_sync(Pid, Messages, Timeout) ->
+    gen_statem:call(Pid, {batch_send, Messages}, Timeout).
+
 %%--------------------------------------------------------------------
 %% gen_server callback
 %%--------------------------------------------------------------------
@@ -121,6 +129,17 @@ connected({call, From}, {send, MsgAndProps}, State = #state{sock = Sock,
                                                         producer_opts = ProducerOpts
                                                         }) ->
     send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgAndProps, get_acl_info(ProducerOpts)),
+    {keep_state, next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)})};
+
+connected({call, From}, {batch_send, Messages}, State = #state{sock = Sock,
+                                                        topic = Topic,
+                                                        queue_id = QueueId,
+                                                        producer_group = ProducerGroup,
+                                                        opaque_id = Opaque,
+                                                        requests = Reqs,
+                                                        producer_opts = ProducerOpts
+                                                        }) ->
+    batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, Messages, get_acl_info(ProducerOpts)),
     {keep_state, next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)})};
 
 connected(cast, {send, MsgAndProps}, State = #state{sock = Sock,
