@@ -40,7 +40,7 @@
 -ifdef(TEST).
 -export([ get_delta_broker_datas/2
         , producer_defragmentation/1
-        , insert_producer/5
+        , insert_producer/6
         , get_producer_pid/2
         , lookup_producer/2
         , producer_count/1
