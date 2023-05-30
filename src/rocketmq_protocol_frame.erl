@@ -124,6 +124,9 @@ serialized(Code, Opaque, ExtFields0, Payload, ACLInfo = #{access_key := AK, secr
         end,
     serialized_(Code, Opaque, Headers, Payload);
 
+serialized(Code, Opaque, ExtFields0, Payload, ACLInfo) when is_function(ACLInfo, 0) ->
+    serialized(Code, Opaque, ExtFields0, Payload, unwrap(ACLInfo));
+
 serialized(Code, Opaque, ExtFields, Payload, _ACLInfo) ->
     Headers =
         case length(ExtFields) of
@@ -209,7 +212,7 @@ message_fixed_headers(Namespace) ->
      {<<"j">>, 0},
      {<<"k">>, <<"false">>}
     ].
-    
+
 json_encode(Input) ->
     jsone:encode(Input).
 
@@ -230,3 +233,8 @@ append_property(Name, Val, <<>>) ->
     <<Name/binary, ?NAME_VALUE_SEPARATOR, Val/binary>>;
 append_property(Name, Val, ProdContext) ->
     <<ProdContext/binary, ?PROPERTY_SEPARATOR, Name/binary, ?NAME_VALUE_SEPARATOR, Val/binary>>.
+
+unwrap(Term) when is_function(Term, 0) ->
+    unwrap(Term());
+unwrap(Term) ->
+    Term.
