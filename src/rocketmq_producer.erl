@@ -16,6 +16,8 @@
 
 -behaviour(gen_statem).
 
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
 -export([ send/2
         , send_sync/2
         , send_sync/3
@@ -54,7 +56,7 @@ callback_mode() -> [state_functions].
                 server,
                 sock,
                 client_id = undefined,
-                send_sock_mod = gen_tcp,
+                sock_mod = gen_tcp,
                 queue_id,
                 opaque_id = 1,
                 opts = [],
@@ -88,7 +90,7 @@ batch_send_sync(Pid, Messages, Timeout) ->
 %% gen_server callback
 %%--------------------------------------------------------------------
 init([QueueId, Topic, Server, ProducerGroup, ProducerOpts]) ->
-    SSLOpts = maps:get(ssl, ProducerOpts, undefined),
+    SSLOpts = maps:get(ssl_opts, ProducerOpts, undefined),
     State = #state{producer_group = ProducerGroup,
                    topic = Topic,
                    queue_id = QueueId,
@@ -97,7 +99,7 @@ init([QueueId, Topic, Server, ProducerGroup, ProducerOpts]) ->
                    server = Server,
                    opts = maps:get(tcp_opts, ProducerOpts, []),
                    ssl_opts = SSLOpts,
-                   send_sock_mod = case SSLOpts of
+                   sock_mod = case SSLOpts of
                                        undefined -> gen_tcp;
                                        _ -> ssl
                                    end,
@@ -114,24 +116,29 @@ idle(_, connecting, State = #state{opts = Opts, ssl_opts = SSLOpts, server = Ser
             gen_tcp:controlling_process(Sock, self()),
             start_keepalive(),
             ClientID = client_id(Sock),
-            case maybe_get_tls_sock(Sock, SSLOpts) of
-                {error, SSLError} ->
+            case maybe_upgrade_tls(Sock, SSLOpts) of
+                {error, SSLErrorReason} = SSLError ->
+                    log(warning, "SSL connect failed (~p:~p): ~p",
+                        [Host, Port, SSLErrorReason]),
                     {stop, {shutdown, SSLError}, State};
                 Sock1 ->
                     {next_state, connected, State#state{sock = Sock1, client_id = ClientID}}
             end;
-        Error ->
-            {stop, {shutdown, Error}, State}
+        {error, TCPConnectErrorReason} = TCPError ->
+            log(warning, "TCP connect failed (~p:~p): ~p",
+                [Host, Port, TCPConnectErrorReason]),
+            {stop, {shutdown, TCPError}, State}
     end;
 
 idle(_, ping, State = #state{sock = undefined}) ->
     {keep_state, State}.
 
-maybe_get_tls_sock(Sock, undefined) ->
+maybe_upgrade_tls(Sock, undefined) ->
     Sock;
-maybe_get_tls_sock(Sock, SSLOpts) ->
+maybe_upgrade_tls(Sock, SSLOpts) ->
     case ssl:connect(Sock, SSLOpts, ?TIMEOUT) of
         {ok, Sock1} ->
+            ?tp(rocketmq_producer_got_tls_sock, #{}),
             Sock1;
         Error ->
             Error
@@ -148,6 +155,7 @@ connected(_EventType, {ssl_closed, Sock}, State = #state{sock = Sock}) ->
     {next_state, idle, State#state{sock = undefined}};
 
 connected(_EventType, {ssl_error, Sock, Reason}, State = #state{sock = Sock}) ->
+    _ = ssl:close(Sock),
     log_error("SSL Socket Error, producer: ~p, reason: ~p~n", [self(), Reason]),
     erlang:send_after(5000, self(), connecting),
     {next_state, idle, State#state{sock = undefined}};
@@ -165,7 +173,7 @@ connected({call, From}, {send, MsgAndProps}, State = #state{sock = Sock,
                                                         opaque_id = Opaque,
                                                         requests = Reqs,
                                                         producer_opts = ProducerOpts,
-                                                        send_sock_mod = SendSockMod
+                                                        sock_mod = SendSockMod
                                                         }) ->
     send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgAndProps, get_acl_info(ProducerOpts), SendSockMod),
     {keep_state, next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)})};
@@ -177,7 +185,7 @@ connected({call, From}, {batch_send, Messages}, State = #state{sock = Sock,
                                                         opaque_id = Opaque,
                                                         requests = Reqs,
                                                         producer_opts = ProducerOpts,
-                                                        send_sock_mod = SendSockMod
+                                                        sock_mod = SendSockMod
                                                         }) ->
     batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, Messages, get_acl_info(ProducerOpts), SendSockMod),
     {keep_state, next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)})};
@@ -190,7 +198,7 @@ connected(cast, {send, MsgAndProps}, State = #state{sock = Sock,
                                                 batch_size = BatchSize,
                                                 producer_opts = ProducerOpts,
                                                 requests = Requests,
-                                                send_sock_mod = SendSockMod
+                                                sock_mod = SendSockMod
                                                 }) ->
     BatchLen =
         case BatchSize =< 1 of
@@ -210,7 +218,7 @@ connected(_EventType, ping, State = #state{sock = Sock,
                                            producer_group = ProducerGroup,
                                            opaque_id = Opaque,
                                            producer_opts = ProducerOpts,
-                                           send_sock_mod = SendSockMod,
+                                           sock_mod = SendSockMod,
                                            client_id = ClientID}) ->
     ping(Sock, ProducerGroup, Opaque, get_acl_info(ProducerOpts), SendSockMod, ClientID),
     {keep_state, next_opaque_id(State)};
@@ -340,6 +348,9 @@ parse_url(Server) ->
     end.
 
 log_error(Fmt, Args) -> error_logger:error_msg(Fmt, Args).
+
+log(Level, Fmt, Args) ->
+    logger:log(Level, "[rocketmq_producer]: " ++ Fmt, Args).
 
 next_opaque_id(State = #state{opaque_id = ?MAX_SEQ_ID}) ->
     State#state{opaque_id = 1};

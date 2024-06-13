@@ -18,6 +18,8 @@
 
 -behaviour(gen_server).
 
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
 -export([start_link/3]).
 
 -export([get_routeinfo_by_topic/2]).
@@ -33,7 +35,8 @@
         , code_change/3
         ]).
 
--record(state, {requests, opaque_id, sock, sock_send_mod = gen_tcp, servers, opts, last_bin = <<>>}).
+-record(state, {requests, opaque_id, sock, sock_mod = gen_tcp, servers, opts, last_bin = <<>>}).
+
 
 -define(TIMEOUT, 60000).
 -define(T_GET_ROUTEINFO, 15000).
@@ -68,7 +71,7 @@ get_status(Pid) ->
 %%--------------------------------------------------------------------
 init([Servers, Opts]) ->
     State = #state{servers = Servers, opts = Opts},
-    SSLOpts = maps:get(ssl, Opts, undefined),
+    SSLOpts = maps:get(ssl_opts, Opts, undefined),
     SockSendMod = case SSLOpts of
                       undefined ->
                           gen_tcp;
@@ -79,7 +82,7 @@ init([Servers, Opts]) ->
         error ->
             {stop, fail_to_connect_rocketmq_server};
         Sock ->
-            {ok, State#state{sock = Sock, opaque_id = 1, requests = #{}, sock_send_mod = SockSendMod}}
+            {ok, State#state{sock = Sock, opaque_id = 1, requests = #{}, sock_mod = SockSendMod}}
     end.
 
 handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = OpaqueId,
@@ -87,9 +90,9 @@ handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = Op
                                                                   requests = Reqs,
                                                                   servers = Servers,
                                                                   opts = Opts,
-                                                                  sock_send_mod = SockSendMod
+                                                                  sock_mod = SockSendMod
                                                                   }) ->
-    case get_sock(Servers, Sock, maps:get(ssl, Opts, undefined)) of
+    case get_sock(Servers, Sock, maps:get(ssl_opts, Opts, undefined)) of
         error ->
             log(error, "Servers: ~p down", [Servers]),
             {noreply, State};
@@ -102,7 +105,7 @@ handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = Op
     end;
 
 handle_call(get_status, _From, State = #state{sock = undefined, servers = Servers, opts = Opts}) ->
-    case get_sock(Servers, undefined, maps:get(ssl, Opts, undefined)) of
+    case get_sock(Servers, undefined, maps:get(ssl_opts, Opts, undefined)) of
         error -> {reply, false, State};
         Sock -> {reply, true, State#state{sock = Sock}}
     end;
@@ -115,10 +118,10 @@ handle_call(_Req, _From, State) ->
 handle_cast(_Req, State) ->
     {noreply, State, hibernate}.
 
-handle_info({tcp, _, Bin}, State) ->
+handle_info({tcp, Sock, Bin}, #state{sock = Sock} = State) ->
     handle_response(Bin, State);
 
-handle_info({ssl, _, Bin}, State) ->
+handle_info({ssl, Sock, Bin}, #state{sock = Sock} = State) ->
     handle_response(Bin, State);
 
 handle_info({tcp_closed, Sock}, State = #state{sock = Sock}) ->
@@ -128,6 +131,7 @@ handle_info({ssl_closed, Sock}, State = #state{sock = Sock}) ->
     {noreply, State#state{sock = undefined}, hibernate};
 
 handle_info({ssl_error, Sock, Reason}, State = #state{sock = Sock}) ->
+    _ = ssl:close(Sock),
     log(error, "RocketMQ client Received SSL socket error: ~p~n", [Reason]),
     {noreply, State#state{sock = undefined}, hibernate};
 
@@ -181,21 +185,26 @@ try_connect([{Host, Port} | Servers], SSLOpts) ->
         {ok, Sock} ->
             tune_buffer(Sock),
             gen_tcp:controlling_process(Sock, self()),
-            case maybe_get_tls_sock(Sock, SSLOpts) of
-                {error, _} ->
+            case maybe_upgrade_tls(Sock, SSLOpts) of
+                {error, TLSConnectErrorReason} ->
+                    log(warning, "Could not establish TLS connection ~p:~p, Reason: ~p",
+                        [Host, Port, TLSConnectErrorReason]),
                     try_connect(Servers, SSLOpts);
                 TLSSock ->
                     TLSSock
             end;
-        _Error ->
+        {error, TCPConnectErrorReason} ->
+            log(warning, "Could not establish TCP connection ~p:~p, Reason: ~p",
+                [Host, Port, TCPConnectErrorReason]),
             try_connect(Servers, SSLOpts)
     end.
 
-maybe_get_tls_sock(Sock, undefined) ->
+maybe_upgrade_tls(Sock, undefined) ->
     Sock;
-maybe_get_tls_sock(Sock, SSLOpts) ->
+maybe_upgrade_tls(Sock, SSLOpts) ->
     case ssl:connect(Sock, SSLOpts, ?TIMEOUT) of
         {ok, Sock1} ->
+            ?tp(rocketmq_client_got_tls_sock, #{}),
             Sock1;
         Error ->
             Error

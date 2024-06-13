@@ -44,10 +44,10 @@ start() ->
 %% and the producer if both the name sever and the brokers use SSL.
 start_tls() ->
     application:ensure_all_started(rocketmq),
-    Clientid = 'test-client',
+    Clientid = 'test-client-ssl',
     Servers = [{"127.0.0.1", 9876}],
     AclInfo = #{access_key => <<"RocketMQ">>, secret_key => <<"12345678">>},
-    ClientCfg = #{acl_info => AclInfo, ssl => [{verify, verify_none}]},
+    ClientCfg = #{acl_info => AclInfo, ssl_opts => [{verify, verify_none}]},
     {ok, Pid} = rocketmq:ensure_supervised_client(Clientid, Servers, ClientCfg),
     io:format("start client ~p~n", [Pid]),
     Topic = <<"test-topic">>,
@@ -56,10 +56,10 @@ start_tls() ->
     ProducerOpts =
         #{batch_size => 100,
           callback => {?MODULE, callback, []},
-          name => producer_t1,
+          name => producer_t1_ssl,
           ref_topic_route_interval => 3000,
           tcp_opts => [{sndbuf, 1048576}],
-          ssl => [{verify, verify_none}],
+          ssl_opts => [{verify, verify_none}],
           acl_info => AclInfo},
     {ok, Producers} =
         rocketmq:ensure_supervised_producers(Clientid, ProducerGroup, Topic, ProducerOpts),
