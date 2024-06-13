@@ -175,8 +175,19 @@ connected({call, From}, {send, MsgAndProps}, State = #state{sock = Sock,
                                                         producer_opts = ProducerOpts,
                                                         sock_mod = SendSockMod
                                                         }) ->
-    send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgAndProps, get_acl_info(ProducerOpts), SendSockMod),
-    {keep_state, next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)})};
+    SendRes =
+        send(Sock,
+             ProducerGroup,
+             get_namespace(ProducerOpts),
+             Topic,
+             Opaque,
+             QueueId,
+             MsgAndProps,
+             get_acl_info(ProducerOpts),
+             SendSockMod),
+    {keep_state,
+     next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)}),
+     [{reply, From, SendRes}]};
 
 connected({call, From}, {batch_send, Messages}, State = #state{sock = Sock,
                                                         topic = Topic,
@@ -187,8 +198,19 @@ connected({call, From}, {batch_send, Messages}, State = #state{sock = Sock,
                                                         producer_opts = ProducerOpts,
                                                         sock_mod = SendSockMod
                                                         }) ->
-    batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, Messages, get_acl_info(ProducerOpts), SendSockMod),
-    {keep_state, next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)})};
+    SendRes =
+        batch_send(Sock,
+                   ProducerGroup,
+                   get_namespace(ProducerOpts),
+                   Topic,
+                   Opaque,
+                   QueueId,
+                   Messages,
+                   get_acl_info(ProducerOpts),
+                   SendSockMod),
+    {keep_state,
+     next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)}),
+     [{reply, From, SendRes}]};
 
 connected(cast, {send, MsgAndProps}, State = #state{sock = Sock,
                                                 topic = Topic,
@@ -200,16 +222,37 @@ connected(cast, {send, MsgAndProps}, State = #state{sock = Sock,
                                                 requests = Requests,
                                                 sock_mod = SendSockMod
                                                 }) ->
-    BatchLen =
+    {BatchLen, SendRes} =
         case BatchSize =< 1 of
             true ->
-                _ = send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgAndProps, get_acl_info(ProducerOpts), SendSockMod),
-                1;
+                SendRes1 = send(Sock,
+                                ProducerGroup,
+                                get_namespace(ProducerOpts),
+                                Topic,
+                                Opaque,
+                                QueueId,
+                                MsgAndProps,
+                                get_acl_info(ProducerOpts),
+                                SendSockMod),
+                {1, SendRes1};
             false ->
                 MsgPropsList = [MsgAndProps | collect_send_calls(BatchSize)],
-                _ = batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgPropsList, get_acl_info(ProducerOpts), SendSockMod),
-                erlang:length(MsgPropsList)
+                SendRes2 = batch_send(Sock,
+                                      ProducerGroup,
+                                      get_namespace(ProducerOpts),
+                                      Topic,
+                                      Opaque,
+                                      QueueId,
+                                      MsgPropsList,
+                                      get_acl_info(ProducerOpts),
+                                      SendSockMod),
+                {erlang:length(MsgPropsList), SendRes2}
         end,
+    case SendRes of
+        ok -> ok;
+        Error ->
+            log(error, "Async send returned error: ~p", [Error])
+    end,
     NRequests = maps:put(Opaque, {batch_len, BatchLen}, Requests),
     NState = next_opaque_id(State),
     {keep_state, NState#state{requests = NRequests}};
