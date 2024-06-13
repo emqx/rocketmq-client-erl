@@ -64,6 +64,10 @@ ok = rocketmq:stop_and_delete_supervised_producers(Producers),
 ok = rocketmq:stop_and_delete_supervised_client('client1').
 ```
 
+### SSL/TLS Connection
+
+See `test:start_tls()` example in `test/test.erl`.
+
 ## License
 
 Apache License Version 2.0

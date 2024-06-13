@@ -53,9 +53,12 @@ callback_mode() -> [state_functions].
                 topic,
                 server,
                 sock,
+                client_id = undefined,
+                send_sock_mod = gen_tcp,
                 queue_id,
                 opaque_id = 1,
                 opts = [],
+                ssl_opts = undefined,
                 callback,
                 batch_size = 0,
                 requests = #{},
@@ -85,6 +88,7 @@ batch_send_sync(Pid, Messages, Timeout) ->
 %% gen_server callback
 %%--------------------------------------------------------------------
 init([QueueId, Topic, Server, ProducerGroup, ProducerOpts]) ->
+    SSLOpts = maps:get(ssl, ProducerOpts, undefined),
     State = #state{producer_group = ProducerGroup,
                    topic = Topic,
                    queue_id = QueueId,
@@ -92,19 +96,30 @@ init([QueueId, Topic, Server, ProducerGroup, ProducerOpts]) ->
                    batch_size = maps:get(batch_size, ProducerOpts, 0),
                    server = Server,
                    opts = maps:get(tcp_opts, ProducerOpts, []),
+                   ssl_opts = SSLOpts,
+                   send_sock_mod = case SSLOpts of
+                                       undefined -> gen_tcp;
+                                       _ -> ssl
+                                   end,
                    producer_opts = ProducerOpts
                    },
     self() ! connecting,
     {ok, idle, State}.
 
-idle(_, connecting, State = #state{opts = Opts, server = Server}) ->
+idle(_, connecting, State = #state{opts = Opts, ssl_opts = SSLOpts, server = Server}) ->
     {Host, Port} = parse_url(Server),
     case gen_tcp:connect(Host, Port, merge_opts(Opts, ?TCPOPTIONS), ?TIMEOUT) of
         {ok, Sock} ->
             tune_buffer(Sock),
             gen_tcp:controlling_process(Sock, self()),
             start_keepalive(),
-            {next_state, connected, State#state{sock = Sock}};
+            ClientID = client_id(Sock),
+            case maybe_get_tls_sock(Sock, SSLOpts) of
+                {error, SSLError} ->
+                    {stop, {shutdown, SSLError}, State};
+                Sock1 ->
+                    {next_state, connected, State#state{sock = Sock1, client_id = ClientID}}
+            end;
         Error ->
             {stop, {shutdown, Error}, State}
     end;
@@ -112,12 +127,35 @@ idle(_, connecting, State = #state{opts = Opts, server = Server}) ->
 idle(_, ping, State = #state{sock = undefined}) ->
     {keep_state, State}.
 
+maybe_get_tls_sock(Sock, undefined) ->
+    Sock;
+maybe_get_tls_sock(Sock, SSLOpts) ->
+    case ssl:connect(Sock, SSLOpts, ?TIMEOUT) of
+        {ok, Sock1} ->
+            Sock1;
+        Error ->
+            Error
+    end.
+
 connected(_EventType, {tcp_closed, Sock}, State = #state{sock = Sock}) ->
     log_error("TcpClosed producer: ~p~n", [self()]),
     erlang:send_after(5000, self(), connecting),
     {next_state, idle, State#state{sock = undefined}};
 
+connected(_EventType, {ssl_closed, Sock}, State = #state{sock = Sock}) ->
+    log_error("SSLClosed producer: ~p~n", [self()]),
+    erlang:send_after(5000, self(), connecting),
+    {next_state, idle, State#state{sock = undefined}};
+
+connected(_EventType, {ssl_error, Sock, Reason}, State = #state{sock = Sock}) ->
+    log_error("SSL Socket Error, producer: ~p, reason: ~p~n", [self(), Reason]),
+    erlang:send_after(5000, self(), connecting),
+    {next_state, idle, State#state{sock = undefined}};
+
 connected(_EventType, {tcp, _, Bin}, State) ->
+    handle_response(Bin, State);
+
+connected(_EventType, {ssl, _, Bin}, State) ->
     handle_response(Bin, State);
 
 connected({call, From}, {send, MsgAndProps}, State = #state{sock = Sock,
@@ -126,9 +164,10 @@ connected({call, From}, {send, MsgAndProps}, State = #state{sock = Sock,
                                                         producer_group = ProducerGroup,
                                                         opaque_id = Opaque,
                                                         requests = Reqs,
-                                                        producer_opts = ProducerOpts
+                                                        producer_opts = ProducerOpts,
+                                                        send_sock_mod = SendSockMod
                                                         }) ->
-    send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgAndProps, get_acl_info(ProducerOpts)),
+    send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgAndProps, get_acl_info(ProducerOpts), SendSockMod),
     {keep_state, next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)})};
 
 connected({call, From}, {batch_send, Messages}, State = #state{sock = Sock,
@@ -137,9 +176,10 @@ connected({call, From}, {batch_send, Messages}, State = #state{sock = Sock,
                                                         producer_group = ProducerGroup,
                                                         opaque_id = Opaque,
                                                         requests = Reqs,
-                                                        producer_opts = ProducerOpts
+                                                        producer_opts = ProducerOpts,
+                                                        send_sock_mod = SendSockMod
                                                         }) ->
-    batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, Messages, get_acl_info(ProducerOpts)),
+    batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, Messages, get_acl_info(ProducerOpts), SendSockMod),
     {keep_state, next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)})};
 
 connected(cast, {send, MsgAndProps}, State = #state{sock = Sock,
@@ -149,16 +189,17 @@ connected(cast, {send, MsgAndProps}, State = #state{sock = Sock,
                                                 opaque_id = Opaque,
                                                 batch_size = BatchSize,
                                                 producer_opts = ProducerOpts,
-                                                requests = Requests
+                                                requests = Requests,
+                                                send_sock_mod = SendSockMod
                                                 }) ->
     BatchLen =
         case BatchSize =< 1 of
             true ->
-                _ = send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgAndProps, get_acl_info(ProducerOpts)),
+                _ = send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgAndProps, get_acl_info(ProducerOpts), SendSockMod),
                 1;
             false ->
                 MsgPropsList = [MsgAndProps | collect_send_calls(BatchSize)],
-                _ = batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgPropsList, get_acl_info(ProducerOpts)),
+                _ = batch_send(Sock, ProducerGroup, get_namespace(ProducerOpts), Topic, Opaque, QueueId, MsgPropsList, get_acl_info(ProducerOpts), SendSockMod),
                 erlang:length(MsgPropsList)
         end,
     NRequests = maps:put(Opaque, {batch_len, BatchLen}, Requests),
@@ -168,8 +209,10 @@ connected(cast, {send, MsgAndProps}, State = #state{sock = Sock,
 connected(_EventType, ping, State = #state{sock = Sock,
                                            producer_group = ProducerGroup,
                                            opaque_id = Opaque,
-                                           producer_opts = ProducerOpts}) ->
-    ping(Sock, ProducerGroup, Opaque, get_acl_info(ProducerOpts)),
+                                           producer_opts = ProducerOpts,
+                                           send_sock_mod = SendSockMod,
+                                           client_id = ClientID}) ->
+    ping(Sock, ProducerGroup, Opaque, get_acl_info(ProducerOpts), SendSockMod, ClientID),
     {keep_state, next_opaque_id(State)};
 
 connected(_EventType, EventContent, State) ->
@@ -233,21 +276,23 @@ result(Header) ->
 start_keepalive() ->
     erlang:send_after(30*1000, self(), ping).
 
-ping(Sock, ProducerGroup, Opaque, ACLInfo) ->
-    {ok, {Host, Port}} = inet:sockname(Sock),
-    Host1 = inet_parse:ntoa(Host),
-    ClientId = list_to_binary(lists:concat([Host1, "@", Port])),
+ping(Sock, ProducerGroup, Opaque, ACLInfo, SendSockMod, ClientId) ->
     Package = rocketmq_protocol_frame:heart_beat(Opaque, ClientId, ProducerGroup, ACLInfo),
-    gen_tcp:send(Sock, Package),
+    SendSockMod:send(Sock, Package),
     start_keepalive().
 
-send(Sock, ProducerGroup, Namespace, Topic, Opaque, QueueId, MsgAndProps, ACLInfo) ->
-    Package = rocketmq_protocol_frame:send_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, MsgAndProps, ACLInfo),
-    gen_tcp:send(Sock, Package).
+client_id(Sock) ->
+    {ok, {Host, Port}} = inet:sockname(Sock),
+    Host1 = inet_parse:ntoa(Host),
+    list_to_binary(lists:concat([Host1, "@", Port])).
 
-batch_send(Sock, ProducerGroup, Namespace, Topic, Opaque, QueueId, MsgAndPropsList, ACLInfo) ->
+send(Sock, ProducerGroup, Namespace, Topic, Opaque, QueueId, MsgAndProps, ACLInfo, SendSockMod) ->
+    Package = rocketmq_protocol_frame:send_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, MsgAndProps, ACLInfo),
+    SendSockMod:send(Sock, Package).
+
+batch_send(Sock, ProducerGroup, Namespace, Topic, Opaque, QueueId, MsgAndPropsList, ACLInfo, SendSockMod) ->
     Package = rocketmq_protocol_frame:send_batch_message_v2(Opaque, ProducerGroup, Namespace, Topic, QueueId, MsgAndPropsList, ACLInfo),
-    gen_tcp:send(Sock, Package).
+    SendSockMod:send(Sock, Package).
 
 
 collect_send_calls(0) ->
