@@ -185,9 +185,7 @@ connected({call, From}, {send, MsgAndProps}, State = #state{sock = Sock,
              MsgAndProps,
              get_acl_info(ProducerOpts),
              SendSockMod),
-    {keep_state,
-     next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)}),
-     [{reply, From, SendRes}]};
+    handle_socket_send_result(State, SendRes, Opaque, From, Reqs);
 
 connected({call, From}, {batch_send, Messages}, State = #state{sock = Sock,
                                                         topic = Topic,
@@ -208,9 +206,7 @@ connected({call, From}, {batch_send, Messages}, State = #state{sock = Sock,
                    Messages,
                    get_acl_info(ProducerOpts),
                    SendSockMod),
-    {keep_state,
-     next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)}),
-     [{reply, From, SendRes}]};
+    handle_socket_send_result(State, SendRes, Opaque, From, Reqs);
 
 connected(cast, {send, MsgAndProps}, State = #state{sock = Sock,
                                                 topic = Topic,
@@ -268,6 +264,16 @@ connected(_EventType, ping, State = #state{sock = Sock,
 
 connected(_EventType, EventContent, State) ->
     handle_response(EventContent, State).
+
+handle_socket_send_result(State, {error, _} = SendRes, Opaque, From, Reqs) ->
+    {keep_state,
+     next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)}),
+     [{reply, From, SendRes}]};
+handle_socket_send_result(State, ok = _SendRes, Opaque, From, Reqs) ->
+     %% Reply will be sent by handle_response/2 if the request do not time
+     %% out
+     {keep_state,
+     next_opaque_id(State#state{requests = maps:put(Opaque, From, Reqs)})}.
 
 code_change(_Vsn, State, Data, _Extra) ->
     {ok, State, Data}.
