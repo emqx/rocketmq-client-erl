@@ -31,3 +31,5 @@ jobs:
         run: make dialyzer
       - name: eunit
         run: make eunit
+      - name: ct
+        run: make ct

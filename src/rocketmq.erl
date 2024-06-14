@@ -35,6 +35,8 @@
         , batch_send_sync/3
         ]).
 
+-type time_ms() :: non_neg_integer().
+
 start() ->
     application:start(rocketmq).
 
@@ -64,7 +66,7 @@ send(Producers, {Message, Context}) when is_map(Context) ->
 
 -spec send_sync(rocketmq_producers:producers(),
                 binary() | {binary(), rocketmq_producers:produce_context()},
-                timer:time()) -> ok | {error, term()}.
+                time_ms()) -> ok | {error, term()}.
 send_sync(Producers, Message, Timeout) when is_binary(Message) ->
     send_sync(Producers, {Message, _Context = #{}}, Timeout);
 send_sync(Producers, {Message, Context}, Timeout) when is_map(Context) ->
@@ -74,7 +76,7 @@ send_sync(Producers, {Message, Context}, Timeout) when is_map(Context) ->
 
 -spec batch_send_sync(rocketmq_producers:producers(),
                 list(binary() | {binary(), rocketmq_producers:produce_context()}),
-                timer:time()) -> ok | {error, term()}.
+                time_ms()) -> ok | {error, term()}.
 batch_send_sync(Producers, Messages, Timeout) ->
     Context = fast_get_context(Messages),
     Messages2 = normalize_batch_messages(Messages),
