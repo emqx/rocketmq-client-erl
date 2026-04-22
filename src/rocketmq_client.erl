@@ -30,6 +30,7 @@
 -export([ init/1
         , handle_call/3
         , handle_cast/2
+        , handle_continue/2
         , handle_info/2
         , terminate/2
         , code_change/3
@@ -70,7 +71,6 @@ get_status(Pid) ->
 %% gen_server callback
 %%--------------------------------------------------------------------
 init([Servers, Opts]) ->
-    State = #state{servers = Servers, opts = Opts},
     SSLOpts = maps:get(ssl_opts, Opts, undefined),
     SockSendMod = case SSLOpts of
                       undefined ->
@@ -78,12 +78,35 @@ init([Servers, Opts]) ->
                       _ ->
                           ssl
                   end,
+    %% Do not perform the initial TCP/TLS connect in init/1.
+    %% The supervisor is blocked while init runs, so a slow/unreachable
+    %% server would stall every other rocketmq client sharing the
+    %% singleton rocketmq_client_sup. Kick off the connect asynchronously
+    %% via handle_continue/2 instead; sock stays undefined until ready.
+    State = #state{
+        servers = Servers,
+        opts = Opts,
+        sock = undefined,
+        opaque_id = 1,
+        requests = #{},
+        sock_mod = SockSendMod
+    },
+    {ok, State, {continue, connect}}.
+
+handle_continue(connect, State = #state{sock = undefined,
+                                        servers = Servers,
+                                        opts = Opts}) ->
+    SSLOpts = maps:get(ssl_opts, Opts, undefined),
     case get_sock(Servers, undefined, SSLOpts) of
         error ->
-            {stop, fail_to_connect_rocketmq_server};
+            %% Leave sock = undefined; subsequent get_status /
+            %% get_routeinfo_by_topic calls will retry the connect.
+            {noreply, State};
         Sock ->
-            {ok, State#state{sock = Sock, opaque_id = 1, requests = #{}, sock_mod = SockSendMod}}
-    end.
+            {noreply, State#state{sock = Sock}}
+    end;
+handle_continue(_, State) ->
+    {noreply, State}.
 
 handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = OpaqueId,
                                                                   sock = Sock,
