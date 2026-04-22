@@ -40,6 +40,7 @@
 
 
 -define(TIMEOUT, 60000).
+-define(CONNECT_TIMEOUT, 10000).
 -define(T_GET_ROUTEINFO, 15000).
 
 -define(TCPOPTIONS, [
@@ -204,7 +205,7 @@ get_sock(_Servers, Sock, _SSLOpts) ->
 try_connect([], _SSLOpts) ->
     error;
 try_connect([{Host, Port} | Servers], SSLOpts) ->
-    case gen_tcp:connect(Host, Port, ?TCPOPTIONS, ?TIMEOUT) of
+    case gen_tcp:connect(Host, Port, ?TCPOPTIONS, ?CONNECT_TIMEOUT) of
         {ok, Sock} ->
             tune_buffer(Sock),
             gen_tcp:controlling_process(Sock, self()),
@@ -225,7 +226,7 @@ try_connect([{Host, Port} | Servers], SSLOpts) ->
 maybe_upgrade_tls(Sock, undefined) ->
     Sock;
 maybe_upgrade_tls(Sock, SSLOpts) ->
-    case ssl:connect(Sock, SSLOpts, ?TIMEOUT) of
+    case ssl:connect(Sock, SSLOpts, ?CONNECT_TIMEOUT) of
         {ok, Sock1} ->
             ?tp(rocketmq_client_got_tls_sock, #{}),
             Sock1;
