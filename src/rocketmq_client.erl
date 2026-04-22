@@ -30,6 +30,7 @@
 -export([ init/1
         , handle_call/3
         , handle_cast/2
+        , handle_continue/2
         , handle_info/2
         , terminate/2
         , code_change/3
@@ -39,6 +40,7 @@
 
 
 -define(TIMEOUT, 60000).
+-define(CONNECT_TIMEOUT, 10000).
 -define(T_GET_ROUTEINFO, 15000).
 
 -define(TCPOPTIONS, [
@@ -70,7 +72,6 @@ get_status(Pid) ->
 %% gen_server callback
 %%--------------------------------------------------------------------
 init([Servers, Opts]) ->
-    State = #state{servers = Servers, opts = Opts},
     SSLOpts = maps:get(ssl_opts, Opts, undefined),
     SockSendMod = case SSLOpts of
                       undefined ->
@@ -78,12 +79,34 @@ init([Servers, Opts]) ->
                       _ ->
                           ssl
                   end,
-    case get_sock(Servers, undefined, SSLOpts) of
+    %% Do not perform the initial TCP/TLS connect in init/1.
+    %% The supervisor is blocked while init runs, so a slow/unreachable
+    %% server would stall every other rocketmq client sharing the
+    %% singleton rocketmq_client_sup. Kick off the connect asynchronously
+    %% via handle_continue/2 instead; sock stays undefined until ready.
+    State = #state{
+        servers = Servers,
+        opts = Opts,
+        sock = undefined,
+        opaque_id = 1,
+        requests = #{},
+        sock_mod = SockSendMod
+    },
+    {ok, State, {continue, connect}}.
+
+handle_continue(connect, State = #state{sock = undefined,
+                                        servers = Servers,
+                                        opts = Opts}) ->
+    case get_sock(Servers, undefined, Opts) of
         error ->
-            {stop, fail_to_connect_rocketmq_server};
+            %% Leave sock = undefined; subsequent get_status /
+            %% get_routeinfo_by_topic calls will retry the connect.
+            {noreply, State};
         Sock ->
-            {ok, State#state{sock = Sock, opaque_id = 1, requests = #{}, sock_mod = SockSendMod}}
-    end.
+            {noreply, State#state{sock = Sock}}
+    end;
+handle_continue(_, State) ->
+    {noreply, State}.
 
 handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = OpaqueId,
                                                                   sock = Sock,
@@ -92,7 +115,7 @@ handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = Op
                                                                   opts = Opts,
                                                                   sock_mod = SockSendMod
                                                                   }) ->
-    case get_sock(Servers, Sock, maps:get(ssl_opts, Opts, undefined)) of
+    case get_sock(Servers, Sock, Opts) of
         error ->
             log(error, "Servers: ~p down", [Servers]),
             {noreply, State};
@@ -105,7 +128,7 @@ handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = Op
     end;
 
 handle_call(get_status, _From, State = #state{sock = undefined, servers = Servers, opts = Opts}) ->
-    case get_sock(Servers, undefined, maps:get(ssl_opts, Opts, undefined)) of
+    case get_sock(Servers, undefined, Opts) of
         error -> {reply, false, State};
         Sock -> {reply, true, State#state{sock = Sock}}
     end;
@@ -173,36 +196,38 @@ tune_buffer(Sock) ->
         = inet:getopts(Sock, [recbuf, sndbuf]),
     inet:setopts(Sock, [{buffer, max(RecBuf, SndBuf)}]).
 
-get_sock(Servers, undefined, SSLOpts) ->
-    try_connect(Servers, SSLOpts);
-get_sock(_Servers, Sock, _SSLOpts) ->
+get_sock(Servers, undefined, Opts) ->
+    SSLOpts = maps:get(ssl_opts, Opts, undefined),
+    ConnectTimeout = maps:get(connect_timeout, Opts, ?CONNECT_TIMEOUT),
+    try_connect(Servers, SSLOpts, ConnectTimeout);
+get_sock(_Servers, Sock, _Opts) ->
     Sock.
 
-try_connect([], _SSLOpts) ->
+try_connect([], _SSLOpts, _ConnectTimeout) ->
     error;
-try_connect([{Host, Port} | Servers], SSLOpts) ->
-    case gen_tcp:connect(Host, Port, ?TCPOPTIONS, ?TIMEOUT) of
+try_connect([{Host, Port} | Servers], SSLOpts, ConnectTimeout) ->
+    case gen_tcp:connect(Host, Port, ?TCPOPTIONS, ConnectTimeout) of
         {ok, Sock} ->
             tune_buffer(Sock),
             gen_tcp:controlling_process(Sock, self()),
-            case maybe_upgrade_tls(Sock, SSLOpts) of
+            case maybe_upgrade_tls(Sock, SSLOpts, ConnectTimeout) of
                 {error, TLSConnectErrorReason} ->
                     log(warning, "Could not establish TLS connection ~p:~p, Reason: ~p",
                         [Host, Port, TLSConnectErrorReason]),
-                    try_connect(Servers, SSLOpts);
+                    try_connect(Servers, SSLOpts, ConnectTimeout);
                 TLSSock ->
                     TLSSock
             end;
         {error, TCPConnectErrorReason} ->
             log(warning, "Could not establish TCP connection ~p:~p, Reason: ~p",
                 [Host, Port, TCPConnectErrorReason]),
-            try_connect(Servers, SSLOpts)
+            try_connect(Servers, SSLOpts, ConnectTimeout)
     end.
 
-maybe_upgrade_tls(Sock, undefined) ->
+maybe_upgrade_tls(Sock, undefined, _ConnectTimeout) ->
     Sock;
-maybe_upgrade_tls(Sock, SSLOpts) ->
-    case ssl:connect(Sock, SSLOpts, ?TIMEOUT) of
+maybe_upgrade_tls(Sock, SSLOpts, ConnectTimeout) ->
+    case ssl:connect(Sock, SSLOpts, ConnectTimeout) of
         {ok, Sock1} ->
             ?tp(rocketmq_client_got_tls_sock, #{}),
             Sock1;
