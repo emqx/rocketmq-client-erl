@@ -24,7 +24,7 @@
 
 -export([get_routeinfo_by_topic/2]).
 
--export([get_status/1]).
+-export([get_status/1, get_connection_state/1]).
 
 %% gen_server Callbacks
 -export([ init/1
@@ -36,7 +36,13 @@
         , code_change/3
         ]).
 
--record(state, {requests, opaque_id, sock, sock_mod = gen_tcp, servers, opts, last_bin = <<>>}).
+-record(state, {requests, opaque_id, sock, sock_mod = gen_tcp, servers, opts, last_bin = <<>>,
+                %% Number of consecutive failed connect attempts since the
+                %% last successful connect. Stays at 0 while the socket is
+                %% up; resets to 0 on every successful get_sock. Used to
+                %% distinguish a transient disconnect (just dropped, not
+                %% yet retried) from a persistent failure.
+                reconnect_attempts = 0}).
 
 
 -define(TIMEOUT, 60000).
@@ -68,6 +74,22 @@ get_routeinfo_by_topic(Pid, Topic) ->
 get_status(Pid) ->
     gen_server:call(Pid, get_status, 5000).
 
+%% Reports connection state without side-effects:
+%%   connected    -- socket is currently up (reconnect_attempts = 0)
+%%   connecting   -- socket down, no failed retry yet (reconnect_attempts = 0)
+%%   disconnected -- one or more failed connect attempts since last success
+-spec get_connection_state(pid() | atom()) ->
+    connected | connecting | disconnected | {error, term()}.
+get_connection_state(Pid) ->
+    try
+        gen_server:call(Pid, get_connection_state, 5000)
+    catch
+        exit:{timeout, _Details} ->
+            {error, timeout};
+        exit:Reason ->
+            {error, {rocketmq_client_down, Reason}}
+    end.
+
 %%--------------------------------------------------------------------
 %% gen_server callback
 %%--------------------------------------------------------------------
@@ -96,14 +118,15 @@ init([Servers, Opts]) ->
 
 handle_continue(connect, State = #state{sock = undefined,
                                         servers = Servers,
-                                        opts = Opts}) ->
+                                        opts = Opts,
+                                        reconnect_attempts = N}) ->
     case get_sock(Servers, undefined, Opts) of
         error ->
             %% Leave sock = undefined; subsequent get_status /
             %% get_routeinfo_by_topic calls will retry the connect.
-            {noreply, State};
+            {noreply, State#state{reconnect_attempts = N + 1}};
         Sock ->
-            {noreply, State#state{sock = Sock}}
+            {noreply, State#state{sock = Sock, reconnect_attempts = 0}}
     end;
 handle_continue(_, State) ->
     {noreply, State}.
@@ -113,27 +136,51 @@ handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = Op
                                                                   requests = Reqs,
                                                                   servers = Servers,
                                                                   opts = Opts,
-                                                                  sock_mod = SockSendMod
+                                                                  sock_mod = SockSendMod,
+                                                                  reconnect_attempts = N
                                                                   }) ->
     case get_sock(Servers, Sock, Opts) of
         error ->
             log(error, "Servers: ~p down", [Servers]),
-            {noreply, State};
+            {noreply, State#state{reconnect_attempts = N + 1}};
         Sock1 ->
             ACLInfo = maps:get(acl_info, Opts, #{}),
             Namespace = maps:get(namespace, Opts, <<>>),
             Package = rocketmq_protocol_frame:get_routeinfo_by_topic(OpaqueId, Namespace, Topic, ACLInfo),
             SockSendMod:send(Sock1, Package),
-            {noreply, next_opaque_id(State#state{requests = maps:put(OpaqueId, From, Reqs), sock = Sock1})}
+            {noreply, next_opaque_id(State#state{requests = maps:put(OpaqueId, From, Reqs),
+                                                 sock = Sock1,
+                                                 reconnect_attempts = 0})}
     end;
 
-handle_call(get_status, _From, State = #state{sock = undefined, servers = Servers, opts = Opts}) ->
+handle_call(get_status, _From, State = #state{sock = undefined,
+                                              servers = Servers,
+                                              opts = Opts,
+                                              reconnect_attempts = N}) ->
     case get_sock(Servers, undefined, Opts) of
-        error -> {reply, false, State};
-        Sock -> {reply, true, State#state{sock = Sock}}
+        error -> {reply, false, State#state{reconnect_attempts = N + 1}};
+        Sock -> {reply, true, State#state{sock = Sock, reconnect_attempts = 0}}
     end;
 handle_call(get_status, _From, State) ->
     {reply, true, State};
+
+handle_call(get_connection_state, _From, State = #state{sock = undefined,
+                                                        reconnect_attempts = 0}) ->
+    %% Socket is down but no failed retry yet (either a transient drop
+    %% that hasn't been retried, or init hasn't run handle_continue yet).
+    %% Report `connecting' so a brief blip doesn't flip the status.
+    {reply, connecting, State};
+handle_call(get_connection_state, _From, State = #state{sock = undefined}) ->
+    %% One or more failed connect attempts since the last success --
+    %% treat as a terminal failure until the host application drives
+    %% another attempt (via get_status, or a producer route refresh).
+    %% Callers map this to the `disconnected' resource status so a
+    %% misconfigured connector surfaces correctly rather than appearing
+    %% to be 'still trying'.
+    {reply, disconnected, State};
+handle_call(get_connection_state, _From, State) ->
+    %% sock =/= undefined -- either a gen_tcp port or an ssl socket tuple
+    {reply, connected, State};
 
 handle_call(_Req, _From, State) ->
     {reply, ok, State, hibernate}.
