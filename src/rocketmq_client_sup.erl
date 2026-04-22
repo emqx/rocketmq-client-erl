@@ -60,11 +60,30 @@ ensure_absence(ClientId) ->
 %% shared-supervisor serialisation that used to make every client's
 %% status lookup queue behind any other client's start_child /
 %% terminate_child / which_children on the same sup.
+%%
+%% Fall back to the supervisor when whereis/1 returns undefined:
+%% there is a brief window during a transient restart where the old
+%% pid has exited (its registered name is already gone) but the new
+%% pid has not yet been spawned / registered. The supervisor still
+%% holds the child spec in that window and can report either the
+%% new pid or the 'restarting' marker, which preserves the previous
+%% error semantics for callers.
 find_client(ClientId) ->
     case whereis(ClientId) of
         Pid when is_pid(Pid) ->
             {ok, Pid};
         undefined ->
+            find_client_via_sup(ClientId)
+    end.
+
+find_client_via_sup(ClientId) ->
+    Children = supervisor:which_children(?SUPERVISOR),
+    case lists:keyfind(ClientId, 1, Children) of
+        {ClientId, Client, _, _} when is_pid(Client) ->
+            {ok, Client};
+        {ClientId, Restarting, _, _} ->
+            {error, Restarting};
+        false ->
             {error, {no_such_client, ClientId}}
     end.
 
