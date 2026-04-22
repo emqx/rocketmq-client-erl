@@ -53,14 +53,18 @@ ensure_absence(ClientId) ->
     end.
 
 %% find client pid from client id
+%%
+%% The client is registered locally under its ClientId atom (see
+%% rocketmq_client:start_link/3), so whereis/1 resolves it in O(1)
+%% without a gen_server:call into the supervisor. This avoids the
+%% shared-supervisor serialisation that used to make every client's
+%% status lookup queue behind any other client's start_child /
+%% terminate_child / which_children on the same sup.
 find_client(ClientId) ->
-    Children = supervisor:which_children(?SUPERVISOR),
-    case lists:keyfind(ClientId, 1, Children) of
-        {ClientId, Client, _, _} when is_pid(Client) ->
-            {ok, Client};
-        {ClientId, Restarting, _, _} ->
-            {error, Restarting};
-        false ->
+    case whereis(ClientId) of
+        Pid when is_pid(Pid) ->
+            {ok, Pid};
+        undefined ->
             {error, {no_such_client, ClientId}}
     end.
 
