@@ -57,7 +57,11 @@
     %% True while an async try_reconnect is in flight, to avoid
     %% queueing multiple reconnect attempts when health checks arrive
     %% faster than a connect attempt can complete.
-    reconnecting = false
+    reconnecting = false,
+    %% Opt-in free-form field reserved for hot upgrades so the record
+    %% layout can be frozen across versions without appending new
+    %% fields.
+    extra = #{} :: map()
 }).
 
 
@@ -306,7 +310,7 @@ kick_async_reconnect(State) ->
 get_sock(Servers, undefined, Opts) ->
     SSLOpts = maps:get(ssl_opts, Opts, undefined),
     ConnectTimeout = maps:get(connect_timeout, Opts, ?CONNECT_TIMEOUT),
-    try_connect(Servers, SSLOpts, ConnectTimeout, no_error);
+    try_connect(Servers, SSLOpts, ConnectTimeout, no_servers);
 get_sock(_Servers, Sock, _Opts) ->
     {ok, Sock}.
 
