@@ -1,5 +1,8 @@
 {VSN,
    [
+    {"0.4.7", [
+      {load_module, rocketmq_producer, brutal_purge, soft_purge, []}
+    ]},
     {<<"0\\.4\\.[0-6]">>, [
       {restart_application,rocketmq}
     ]},
@@ -8,6 +11,9 @@
     ]}
    ],
    [
+    {"0.4.7", [
+      {load_module, rocketmq_producer, brutal_purge, soft_purge, []}
+    ]},
     {<<"0\\.4\\.[0-6]">>, [
       {restart_application,rocketmq}
     ]},
