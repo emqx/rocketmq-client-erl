@@ -196,7 +196,7 @@ do_response(Header, Reqs, Callback, Topic) ->
                             end
                     end
             end,
-            Reqs;
+            maps:remove(Opaque, Reqs);
         undefined ->
             %% ignore heart beat response
             Reqs;
