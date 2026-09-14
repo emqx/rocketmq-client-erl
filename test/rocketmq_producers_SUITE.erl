@@ -18,15 +18,19 @@
 -export([t_topic_not_found_returns_error/1,
          t_topic_not_found_is_retried_fresh/1,
          t_default_topic_lookup_is_not_namespaced/1,
-         t_check_topic_reports_topic_not_found/1]).
+         t_check_topic_reports_topic_not_found/1,
+         t_other_error_codes_are_not_topic_not_found/1]).
 
 -define(TOPIC_NOT_EXIST, 17).
+-define(SYSTEM_BUSY, 2).
+-define(NO_PERMISSION, 16).
 
 all() ->
     [t_topic_not_found_returns_error,
      t_topic_not_found_is_retried_fresh,
      t_default_topic_lookup_is_not_namespaced,
-     t_check_topic_reports_topic_not_found].
+     t_check_topic_reports_topic_not_found,
+     t_other_error_codes_are_not_topic_not_found].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(rocketmq),
@@ -92,6 +96,26 @@ t_check_topic_reports_topic_not_found(Config) ->
     ?assertNot(is_child(ClientId, ?FUNCTION_NAME)),
     ok.
 
+%% A bodyless answer with another code (name server busy, access denied)
+%% is a lookup failure that keeps its code, not a missing topic, and it
+%% does not fall back to the default topic.
+t_other_error_codes_are_not_topic_not_found(Config) ->
+    ClientId = ?config(client_id, Config),
+    Server = ?config(fake_namesrv, Config),
+    lists:foreach(
+      fun(Code) ->
+              set_response_code(Server, Code),
+              ?assertMatch({error, {route_lookup_failed, #{topic := <<"t1">>, code := Code, remark := <<_/binary>>}}},
+                           rocketmq:check_topic(ClientId, <<"t1">>)),
+              ?assertMatch({error, {route_lookup_failed, #{topic := <<"t1">>, code := Code}}},
+                           rocketmq:ensure_supervised_producers(
+                             ClientId, <<"group1">>, <<"t1">>, producer_opts(?FUNCTION_NAME)))
+      end,
+      [?SYSTEM_BUSY, ?NO_PERMISSION]),
+    %% Only the user topic was asked about: no default topic fallback.
+    ?assertEqual(lists:duplicate(4, <<"ns1%t1">>), requested_topics(Server)),
+    ok.
+
 %%--------------------------------------------------------------------
 %% helpers
 
@@ -103,16 +127,21 @@ is_child(ClientId, Name) ->
 producer_opts(Name) ->
     #{name => Name, namespace => <<"ns1">>, ref_topic_route_interval => 60000}.
 
-%% A name server that answers every route request with TOPIC_NOT_EXIST
-%% and records the topics it was asked about.
+%% A name server that answers every route request with a bodyless error
+%% (TOPIC_NOT_EXIST unless set otherwise) and records the topics it was
+%% asked about.
 -record(fake, {lsock, ctrl}).
 
 start_fake_namesrv() ->
     {ok, LSock} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}, {packet, raw}]),
     {ok, Port} = inet:port(LSock),
     Parent = self(),
-    Ctrl = spawn_link(fun() -> fake_ctrl(LSock, Parent, [], []) end),
+    Ctrl = spawn_link(fun() -> fake_ctrl(LSock, Parent, [], [], ?TOPIC_NOT_EXIST) end),
     {ok, #fake{lsock = LSock, ctrl = Ctrl}, Port}.
+
+set_response_code(#fake{ctrl = Ctrl}, Code) ->
+    Ctrl ! {set_code, Code},
+    ok.
 
 stop_fake_namesrv(#fake{ctrl = Ctrl}) ->
     Ref = erlang:monitor(process, Ctrl),
@@ -123,37 +152,39 @@ requested_topics(#fake{ctrl = Ctrl}) ->
     Ctrl ! {topics, self()},
     receive {topics, Topics} -> Topics after 2000 -> error(fake_namesrv_timeout) end.
 
-fake_ctrl(LSock, Parent, Socks, Topics) ->
+fake_ctrl(LSock, Parent, Socks, Topics, Code) ->
     receive
         stop ->
             catch gen_tcp:close(LSock),
             [catch gen_tcp:close(S) || S <- Socks],
             ok;
+        {set_code, NewCode} ->
+            fake_ctrl(LSock, Parent, Socks, Topics, NewCode);
         {topics, From} ->
             From ! {topics, lists:reverse(Topics)},
-            fake_ctrl(LSock, Parent, Socks, Topics);
+            fake_ctrl(LSock, Parent, Socks, Topics, Code);
         {tcp, Sock, Bin} ->
             {Header, _Payload, <<>>} = rocketmq_protocol_frame:parse(Bin),
             Opaque = maps:get(<<"opaque">>, Header),
             Topic = maps:get(<<"topic">>, maps:get(<<"extFields">>, Header)),
-            ok = gen_tcp:send(Sock, topic_not_exist_response(Opaque, Topic)),
-            fake_ctrl(LSock, Parent, Socks, [Topic | Topics]);
+            ok = gen_tcp:send(Sock, error_response(Code, Opaque, Topic)),
+            fake_ctrl(LSock, Parent, Socks, [Topic | Topics], Code);
         {tcp_closed, _Sock} ->
-            fake_ctrl(LSock, Parent, Socks, Topics)
+            fake_ctrl(LSock, Parent, Socks, Topics, Code)
     after 0 ->
         case gen_tcp:accept(LSock, 50) of
             {ok, Sock} ->
                 ok = inet:setopts(Sock, [{active, true}]),
-                fake_ctrl(LSock, Parent, [Sock | Socks], Topics);
+                fake_ctrl(LSock, Parent, [Sock | Socks], Topics, Code);
             {error, timeout} ->
-                fake_ctrl(LSock, Parent, Socks, Topics);
+                fake_ctrl(LSock, Parent, Socks, Topics, Code);
             {error, _} ->
                 ok
         end
     end.
 
-topic_not_exist_response(Opaque, Topic) ->
-    Header = jsone:encode([{<<"code">>, ?TOPIC_NOT_EXIST},
+error_response(Code, Opaque, Topic) ->
+    Header = jsone:encode([{<<"code">>, Code},
                            {<<"opaque">>, Opaque},
                            {<<"flag">>, 1},
                            {<<"language">>, <<"JAVA">>},

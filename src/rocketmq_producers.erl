@@ -86,8 +86,10 @@
 %% Start (or find) the producers manager for Topic.
 %%
 %% Returns {error, {topic_not_found, #{topic := Topic, remark := Remark}}}
-%% when neither Topic nor the auto-create default topic has a route on
-%% the name server; Remark is the name server's own explanation.
+%% when the name server answers TOPIC_NOT_EXIST for Topic and for the
+%% auto-create default topic; Remark is the name server's own explanation.
+%% Other name server error codes come back as
+%% {error, {route_lookup_failed, #{topic, code, remark}}}.
 -spec start_supervised(clientid(), producer_group(), topic(), producer_opts()) ->
     {ok, producers()} | {error, term()}.
 start_supervised(ClientId, ProducerGroup, Topic, ProducerOpts) ->
@@ -363,18 +365,22 @@ maybe_start_producer(Pid, State = #state{topic = Topic}) ->
             {error, Reason}
     end.
 
-%% Find the route for Topic, or the route of the auto-create default
-%% topic when Topic has none: the broker then creates Topic at the first
-%% send when `autoCreateTopicEnable = true`. When neither exists the
-%% topic does not exist and the broker does not auto-create topics; the
-%% error carries the name server's own remark, which names the default
+%% Find the route for Topic. When the name server answers TOPIC_NOT_EXIST, fall back to
+%% the route of the auto-create default topic: the broker then creates Topic at the first
+%% send when `autoCreateTopicEnable = true'. When that answer is TOPIC_NOT_EXIST too, the
+%% topic does not exist and the broker does not auto-create topics; the error carries the
+%% name server's own remark, which names the default topic. Any other error code
+%% (SYSTEM_BUSY, NO_PERMISSION, ...) is reported as is and never mistaken for a missing
 %% topic.
 find_route(Pid, Topic) ->
     case rocketmq_client:get_routeinfo_by_topic(Pid, Topic) of
-        {ok, {_Header, undefined}} ->
-            find_default_topic_route(Pid, Topic);
-        {ok, {_, RouteInfo}} ->
+        {ok, {_Header, RouteInfo}} when RouteInfo =/= undefined ->
             {ok, RouteInfo};
+        {ok, {Header, undefined}} ->
+            case response_code(Header) of
+                ?RESPONSE_TOPIC_NOT_EXIST -> find_default_topic_route(Pid, Topic);
+                Code -> route_lookup_failed(Topic, Code, Header)
+            end;
         {error, Reason} ->
             logger:error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, Topic]),
             {error, {get_routeinfo_by_topic_failed, Reason}}
@@ -382,16 +388,30 @@ find_route(Pid, Topic) ->
 
 find_default_topic_route(Pid, Topic) ->
     case rocketmq_client:get_routeinfo_by_topic(Pid, ?DEFAULT_TOPIC) of
-        {ok, {Header, undefined}} ->
-            Remark = maps:get(<<"remark">>, Header, undefined),
-            logger:error("Start producer failed, topic: ~p, remark: ~p", [Topic, Remark]),
-            {error, {topic_not_found, #{topic => Topic, remark => Remark}}};
-        {ok, {_, RouteInfo}} ->
+        {ok, {_Header, RouteInfo}} when RouteInfo =/= undefined ->
             {ok, RouteInfo};
+        {ok, {Header, undefined}} ->
+            case response_code(Header) of
+                ?RESPONSE_TOPIC_NOT_EXIST ->
+                    Remark = remark(Header),
+                    logger:error("Start producer failed, topic: ~p, remark: ~p", [Topic, Remark]),
+                    {error, {topic_not_found, #{topic => Topic, remark => Remark}}};
+                Code ->
+                    route_lookup_failed(?DEFAULT_TOPIC, Code, Header)
+            end;
         {error, Reason} ->
             logger:error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, ?DEFAULT_TOPIC]),
             {error, {get_routeinfo_by_topic_failed, Reason}}
     end.
+
+route_lookup_failed(Topic, Code, Header) ->
+    Remark = remark(Header),
+    logger:error("Get routeinfo by topic failed, topic: ~p, code: ~p, remark: ~p", [Topic, Code, Remark]),
+    {error, {route_lookup_failed, #{topic => Topic, code => Code, remark => Remark}}}.
+
+response_code(Header) -> maps:get(<<"code">>, Header, undefined).
+
+remark(Header) -> maps:get(<<"remark">>, Header, undefined).
 
 find_queue_data(_Key, []) ->
     [];
