@@ -68,7 +68,7 @@ t_topic_not_found_is_retried_fresh(Config) ->
                  rocketmq:ensure_supervised_producers(ClientId, <<"group1">>, <<"t1">>, Opts)),
     ?assertMatch({error, {topic_not_found, _}},
                  rocketmq:ensure_supervised_producers(ClientId, <<"group1">>, <<"t1">>, Opts)),
-    ?assertEqual([], supervisor:which_children(rocketmq_producers_sup)),
+    ?assertNot(is_child(ClientId, ?FUNCTION_NAME)),
     ok.
 
 %% The user topic is looked up with the namespace prefix; the default
@@ -89,11 +89,16 @@ t_check_topic_reports_topic_not_found(Config) ->
                  rocketmq:check_topic(ClientId, <<"t1">>)),
     ?assertEqual([<<"ns1%t1">>, ?DEFAULT_TOPIC],
                  requested_topics(?config(fake_namesrv, Config))),
-    ?assertEqual([], supervisor:which_children(rocketmq_producers_sup)),
+    ?assertNot(is_child(ClientId, ?FUNCTION_NAME)),
     ok.
 
 %%--------------------------------------------------------------------
 %% helpers
+
+%% Other suites on the same node may leave their own producers under the
+%% supervisor, so only look for ours (child id {ClientId, Name}).
+is_child(ClientId, Name) ->
+    lists:keymember({ClientId, Name}, 1, supervisor:which_children(rocketmq_producers_sup)).
 
 producer_opts(Name) ->
     #{name => Name, namespace => <<"ns1">>, ref_topic_route_interval => 60000}.
