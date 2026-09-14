@@ -82,15 +82,25 @@
 -define(PRODUCER_INFO(INDEX, BORKER_NAME, QUEUE_SEQ_NUM, PID, BROKER_ADDR),
     {INDEX, BORKER_NAME, QUEUE_SEQ_NUM, PID, BROKER_ADDR}).
 
--spec start_supervised(clientid(), producer_group(), topic(), producer_opts()) -> {ok, producers()}.
+%% Start (or find) the producers manager for Topic.
+%%
+%% Returns {error, {topic_not_found, #{topic := Topic, remark := Remark}}}
+%% when neither Topic nor the auto-create default topic has a route on
+%% the name server; Remark is the name server's own explanation.
+-spec start_supervised(clientid(), producer_group(), topic(), producer_opts()) ->
+    {ok, producers()} | {error, term()}.
 start_supervised(ClientId, ProducerGroup, Topic, ProducerOpts) ->
-  {ok, Pid} = rocketmq_producers_sup:ensure_present(ClientId, ProducerGroup, Topic, ProducerOpts),
-  WorkersTab = gen_server:call(Pid, get_workers, infinity),
-  {ok, #{client => ClientId,
-         topic => Topic,
-         workers => WorkersTab,
-         partitioner => maps:get(partitioner, ProducerOpts, roundrobin)
-        }}.
+  case rocketmq_producers_sup:ensure_present(ClientId, ProducerGroup, Topic, ProducerOpts) of
+      {ok, Pid} ->
+          WorkersTab = gen_server:call(Pid, get_workers, infinity),
+          {ok, #{client => ClientId,
+                 topic => Topic,
+                 workers => WorkersTab,
+                 partitioner => maps:get(partitioner, ProducerOpts, roundrobin)
+                }};
+      {error, Reason} ->
+          {error, Reason}
+  end.
 
 stop_supervised(#{client := ClientId, workers := WorkersTab}) ->
   rocketmq_producers_sup:ensure_absence(ClientId, WorkersTab).
@@ -344,12 +354,16 @@ maybe_start_producer(Pid, State = #state{topic = Topic}) ->
             {error, {get_routeinfo_by_topic_failed, Reason}}
     end.
 
-maybe_start_producer_using_default_topic(Pid, State) ->
+maybe_start_producer_using_default_topic(Pid, State = #state{topic = Topic}) ->
     case rocketmq_client:get_routeinfo_by_topic(Pid, ?DEFAULT_TOPIC) of
         {ok, {Header, undefined}} ->
-            logger:error("Start producer failed, remark: ~p",
-                [maps:get(<<"remark">>, Header, undefined)]),
-            {error, {start_producer_failed, Header}};
+            %% Neither the topic nor the auto-create default topic has a
+            %% route: the topic does not exist and the broker does not
+            %% auto-create topics. The remark is the name server's own
+            %% explanation, and it names the default topic.
+            Remark = maps:get(<<"remark">>, Header, undefined),
+            logger:error("Start producer failed, topic: ~p, remark: ~p", [Topic, Remark]),
+            {error, {topic_not_found, #{topic => Topic, remark => Remark}}};
         {ok, {_, RouteInfo}} ->
             start_producer_with_route_info(RouteInfo, State);
         {error, Reason} ->

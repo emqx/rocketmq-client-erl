@@ -37,14 +37,22 @@ init([]) ->
     Children = [], %% dynamically added/stopped
     {ok, {SupFlags, Children}}.
 
-%% ensure a client started under supervisor
+%% ensure a producers manager started under supervisor
+%%
+%% A child whose init/1 fails (for example because the topic has no
+%% route and the broker does not auto-create topics) is not kept by the
+%% supervisor, so the next call starts a fresh attempt.
+-spec ensure_present(atom(), binary(), binary(), map()) -> {ok, pid()} | {error, term()}.
 ensure_present(ClientId, ProducerGroup, Topic, ProducerOpts) ->
     ChildSpec = child_spec(ClientId, ProducerGroup, Topic, ProducerOpts),
     case supervisor:start_child(?SUPERVISOR, ChildSpec) of
         {ok, Pid} -> {ok, Pid};
         {error, {already_started, Pid}} -> {ok, Pid};
         {error, {{already_started, Pid}, _}} -> {ok, Pid};
-        {error, already_present} -> {error, not_running}
+        {error, already_present} -> {error, not_running};
+        {error, {{shutdown, Reason}, _ChildSpec}} -> {error, Reason};
+        {error, {Reason, _ChildSpec}} -> {error, Reason};
+        {error, Reason} -> {error, Reason}
     end.
 
 %% ensure client stopped and deleted under supervisor
