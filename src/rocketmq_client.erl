@@ -241,10 +241,10 @@ handle_info({ssl_error, Sock, Reason}, State = #state{sock = Sock}) ->
     {noreply, reconnect_after_drop({ssl_error, Reason}, State), hibernate};
 
 handle_info({connect_result, Worker, Result}, State = #state{extra = Extra}) ->
-    case maps:get(connect_worker, Extra, undefined) of
-        {Worker, Ref} ->
+    case maps:take(connect_worker, Extra) of
+        {{Worker, Ref}, Extra1} ->
             erlang:demonitor(Ref, [flush]),
-            State1 = State#state{reconnecting = false, extra = maps:remove(connect_worker, Extra)},
+            State1 = State#state{reconnecting = false, extra = Extra1},
             {noreply, connect_result(Result, State1), hibernate};
         _ ->
             %% A stale worker (its socket, if any, was closed by the worker).
@@ -252,9 +252,9 @@ handle_info({connect_result, Worker, Result}, State = #state{extra = Extra}) ->
     end;
 
 handle_info({'DOWN', Ref, process, Worker, Reason}, State = #state{extra = Extra}) ->
-    case maps:get(connect_worker, Extra, undefined) of
-        {Worker, Ref} ->
-            State1 = State#state{reconnecting = false, extra = maps:remove(connect_worker, Extra)},
+    case maps:take(connect_worker, Extra) of
+        {{Worker, Ref}, Extra1} ->
+            State1 = State#state{reconnecting = false, extra = Extra1},
             {noreply, record_connect_failure({connect_worker_down, Reason}, State1), hibernate};
         _ ->
             {noreply, State, hibernate}
@@ -319,8 +319,11 @@ connect_worker(Client, Servers, Opts, SockMod) ->
         case get_sock(Servers, undefined, Opts) of
             {ok, Sock} ->
                 case SockMod:controlling_process(Sock, Client) of
-                    ok -> {ok, Sock};
-                    {error, Reason} -> _ = SockMod:close(Sock), {error, {controlling_process, Reason}}
+                    ok ->
+                        {ok, Sock};
+                    {error, Reason} ->
+                        _ = SockMod:close(Sock),
+                        {error, {controlling_process, Reason}}
                 end;
             {error, _} = Error ->
                 Error
