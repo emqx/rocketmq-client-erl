@@ -16,3 +16,6 @@
 
 -define(DEFAULT_TOPIC, <<"TBW102">>).
 
+%% Response codes (org.apache.rocketmq.common.protocol.ResponseCode).
+-define(RESPONSE_SUCCESS, 0).
+-define(RESPONSE_TOPIC_NOT_EXIST, 17).

@@ -17,7 +17,9 @@
 
 -export([t_connect_refused_reports_disconnected_with_reason/1,
          t_connect_success_reports_connected/1,
-         t_socket_drop_flips_to_connecting_with_reason/1,
+         t_socket_drop_reconnects_inline/1,
+         t_connect_in_flight_does_not_block_status/1,
+         t_socket_drop_with_server_gone_reports_disconnected/1,
          t_reconnect_driven_by_get_connection_state_poll/1,
          t_reconnecting_flag_dedups_polls/1,
          t_unreachable_then_reachable_recovers/1,
@@ -26,7 +28,9 @@
 all() ->
     [t_connect_refused_reports_disconnected_with_reason,
      t_connect_success_reports_connected,
-     t_socket_drop_flips_to_connecting_with_reason,
+     t_socket_drop_reconnects_inline,
+     t_connect_in_flight_does_not_block_status,
+     t_socket_drop_with_server_gone_reports_disconnected,
      t_reconnect_driven_by_get_connection_state_poll,
      t_reconnecting_flag_dedups_polls,
      t_unreachable_then_reachable_recovers,
@@ -58,9 +62,15 @@ t_connect_refused_reports_disconnected_with_reason(Config) ->
     Port = free_port(),
     {ok, Pid} = start_client(?config(client_id, Config),
                              [{"127.0.0.1", Port}], #{}),
-    %% handle_continue fires the first attempt synchronously before the
-    %% gen_server starts accepting external calls; it fails immediately
-    %% and bumps reconnect_attempts.
+    %% The first attempt runs in a connect worker started from
+    %% handle_continue; it fails within milliseconds on loopback and
+    %% bumps reconnect_attempts.
+    ok = wait_for(fun() ->
+                          case rocketmq_client:get_connection_state(Pid) of
+                              {disconnected, _} -> true;
+                              _ -> false
+                          end
+                  end, 2000),
     ?assertMatch({disconnected, {tcp_connect_error, {_, _, econnrefused}}},
                  rocketmq_client:get_connection_state(Pid)),
     ok.
@@ -74,24 +84,58 @@ t_connect_success_reports_connected(Config) ->
     stop_listener(Listener),
     ok.
 
-t_socket_drop_flips_to_connecting_with_reason(Config) ->
+t_socket_drop_reconnects_inline(Config) ->
+    %% The name server closes idle connections (serverChannelMaxIdleTimeSeconds).
+    %% A passive close while the server is still up must be repaired
+    %% inline, so a health check that follows sees `connected' rather
+    %% than a one-poll `connecting' blip.
     {ok, Listener, Port} = start_listener(),
     {ok, Pid} = start_client(?config(client_id, Config),
                              [{"127.0.0.1", Port}], #{}),
     ok = wait_for(fun() -> rocketmq_client:get_connection_state(Pid) =:= connected end, 2000),
-    %% Close the listener and all its accepted sockets to simulate a drop.
+    ok = wait_for(fun() -> accepted_count(Listener) =:= 1 end, 2000),
+    drop_accepted(Listener),
+    %% The reconnect starts at the drop, without a poll; on loopback the
+    %% new socket is owned by the client within milliseconds.
+    ok = wait_for(fun() -> accepted_count(Listener) =:= 2 end, 2000),
+    ok = wait_for(fun() -> rocketmq_client:get_connection_state(Pid) =:= connected end, 2000),
+    ?assertEqual(connected, rocketmq_client:get_connection_state(Pid)),
     stop_listener(Listener),
+    ok.
+
+t_connect_in_flight_does_not_block_status(Config) ->
+    %% A listener that accepts TCP but never answers the TLS handshake:
+    %% the connect attempt stalls until connect_timeout. The client must
+    %% keep answering status calls meanwhile, since the attempt runs in
+    %% a worker, not in the client's own mailbox loop.
+    {ok, Listener, Port} = start_listener(),
+    {ok, Pid} = start_client(?config(client_id, Config), [{"127.0.0.1", Port}],
+                             #{ssl_opts => [{verify, verify_none}], connect_timeout => 3000}),
+    T0 = erlang:monotonic_time(millisecond),
+    State = rocketmq_client:get_connection_state(Pid),
+    Elapsed = erlang:monotonic_time(millisecond) - T0,
+    ?assertEqual(connecting, State),
+    ?assert(Elapsed < 1000, {status_call_blocked_ms, Elapsed}),
+    %% The stalled handshake times out and is reported as a failure.
     ok = wait_for(
            fun() ->
                    case rocketmq_client:get_connection_state(Pid) of
-                       connecting -> true;
-                       {disconnected, _} -> true;
+                       {disconnected, {tls_connect_error, _}} -> true;
                        _ -> false
                    end
-           end, 2000),
-    %% After the drop but before the next failed retry, the status is
-    %% `connecting'. After the next retry fails (listener is gone) it
-    %% flips to {disconnected, _}.
+           end, 6000),
+    stop_listener(Listener),
+    ok.
+
+t_socket_drop_with_server_gone_reports_disconnected(Config) ->
+    {ok, Listener, Port} = start_listener(),
+    {ok, Pid} = start_client(?config(client_id, Config),
+                             [{"127.0.0.1", Port}], #{}),
+    ok = wait_for(fun() -> rocketmq_client:get_connection_state(Pid) =:= connected end, 2000),
+    %% Close the listener and all its accepted sockets: the inline
+    %% reconnect fails, so the state goes straight to {disconnected, _}
+    %% with the connect error, never through `connecting'.
+    stop_listener(Listener),
     ok = wait_for(
            fun() ->
                    case rocketmq_client:get_connection_state(Pid) of
@@ -99,11 +143,8 @@ t_socket_drop_flips_to_connecting_with_reason(Config) ->
                        _ -> false
                    end
            end, 5000),
-    {disconnected, Reason} = rocketmq_client:get_connection_state(Pid),
-    %% Reason is either the original drop (tcp_closed) or the follow-up
-    %% failed reconnect. Either way, a concrete tagged reason rather
-    %% than `undefined'.
-    ?assertMatch(R when R =/= undefined, Reason),
+    ?assertMatch({disconnected, {tcp_connect_error, {_, _, econnrefused}}},
+                 rocketmq_client:get_connection_state(Pid)),
     ok.
 
 t_reconnect_driven_by_get_connection_state_poll(Config) ->
@@ -111,7 +152,12 @@ t_reconnect_driven_by_get_connection_state_poll(Config) ->
     Port = free_port(),
     {ok, Pid} = start_client(?config(client_id, Config),
                              [{"127.0.0.1", Port}], #{}),
-    ?assertMatch({disconnected, _}, rocketmq_client:get_connection_state(Pid)),
+    ok = wait_for(fun() ->
+                          case rocketmq_client:get_connection_state(Pid) of
+                              {disconnected, _} -> true;
+                              _ -> false
+                          end
+                  end, 2000),
     %% Bring up a listener on that port, then poll a few times to
     %% confirm get_connection_state drives the reconnect itself (no
     %% producer traffic required).
@@ -223,7 +269,15 @@ listener_ctrl_loop(LSock, Parent, Accepted) ->
         stop ->
             catch gen_tcp:close(LSock),
             [catch gen_tcp:close(S) || S <- Accepted],
-            ok
+            ok;
+        {accepted_count, From} ->
+            From ! {accepted_count, length(Accepted)},
+            listener_ctrl_loop(LSock, Parent, Accepted);
+        drop_accepted ->
+            %% Close the accepted sockets but keep listening, like a
+            %% server closing an idle connection.
+            [catch gen_tcp:close(S) || S <- Accepted],
+            listener_ctrl_loop(LSock, Parent, Accepted)
     after 0 ->
         case gen_tcp:accept(LSock, 100) of
             {ok, Sock} ->
@@ -237,6 +291,14 @@ listener_ctrl_loop(LSock, Parent, Accepted) ->
                 ok
         end
     end.
+
+accepted_count(#listener{ctrl = Ctrl}) ->
+    Ctrl ! {accepted_count, self()},
+    receive {accepted_count, N} -> N after 2000 -> error(listener_timeout) end.
+
+drop_accepted(#listener{ctrl = Ctrl}) ->
+    Ctrl ! drop_accepted,
+    ok.
 
 stop_listener(#listener{ctrl = Ctrl}) ->
     Ref = erlang:monitor(process, Ctrl),

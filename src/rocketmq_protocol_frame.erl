@@ -157,7 +157,11 @@ plist_value_binary([{_K, V} | List], Res) ->
     VBin = bin(V),
     plist_value_binary(List, <<VBin/binary, Res/binary>>).
 
+%% The auto-create default topic is a broker system topic. The broker
+%% looks it up by its bare name, so it must never carry a namespace
+%% prefix; the Java client makes the same exception (NamespaceUtil).
 maybe_with_namespace(<<>>, ResourceName) -> ResourceName;
+maybe_with_namespace(_Namespace, ?DEFAULT_TOPIC) -> ?DEFAULT_TOPIC;
 maybe_with_namespace(Namespace, ResourceName) ->
     <<Namespace/binary, "%", ResourceName/binary>>.
 

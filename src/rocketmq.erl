@@ -27,6 +27,7 @@
 %% Primitive producer worker management APIs
 -export([ ensure_supervised_producers/4
         , stop_and_delete_supervised_producers/1
+        , check_topic/2
         ]).
 
 %% Messaging APIs
@@ -54,6 +55,13 @@ ensure_supervised_producers(ClientId, ProducerGroup, Topic, Opts) ->
 
 stop_and_delete_supervised_producers(Producers) ->
     rocketmq_producers:stop_supervised(Producers).
+
+%% Check that Topic can be produced to: it has a route, or the broker
+%% auto-creates topics. Returns {error, {topic_not_found, #{topic :=
+%% Topic, remark := Remark}}} when it cannot.
+-spec check_topic(atom(), binary()) -> ok | {error, term()}.
+check_topic(ClientId, Topic) ->
+    rocketmq_producers:check_topic(ClientId, Topic).
 
 -spec send(rocketmq_producers:producers(),
            binary() | {binary(), rocketmq_producers:produce_context()}) -> ok.

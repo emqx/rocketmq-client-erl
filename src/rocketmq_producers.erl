@@ -31,6 +31,7 @@
 
 -export([ start_supervised/4
         , stop_supervised/1
+        , check_topic/2
         ]).
 
 -export([ pick_producer/1
@@ -82,18 +83,45 @@
 -define(PRODUCER_INFO(INDEX, BORKER_NAME, QUEUE_SEQ_NUM, PID, BROKER_ADDR),
     {INDEX, BORKER_NAME, QUEUE_SEQ_NUM, PID, BROKER_ADDR}).
 
--spec start_supervised(clientid(), producer_group(), topic(), producer_opts()) -> {ok, producers()}.
+%% Start (or find) the producers manager for Topic.
+%%
+%% Returns {error, {topic_not_found, #{topic := Topic, remark := Remark}}}
+%% when the name server answers TOPIC_NOT_EXIST for Topic and for the
+%% auto-create default topic; Remark is the name server's own explanation.
+%% Other name server error codes come back as
+%% {error, {route_lookup_failed, #{topic, code, remark}}}.
+-spec start_supervised(clientid(), producer_group(), topic(), producer_opts()) ->
+    {ok, producers()} | {error, term()}.
 start_supervised(ClientId, ProducerGroup, Topic, ProducerOpts) ->
-  {ok, Pid} = rocketmq_producers_sup:ensure_present(ClientId, ProducerGroup, Topic, ProducerOpts),
-  WorkersTab = gen_server:call(Pid, get_workers, infinity),
-  {ok, #{client => ClientId,
-         topic => Topic,
-         workers => WorkersTab,
-         partitioner => maps:get(partitioner, ProducerOpts, roundrobin)
-        }}.
+  case rocketmq_producers_sup:ensure_present(ClientId, ProducerGroup, Topic, ProducerOpts) of
+      {ok, Pid} ->
+          WorkersTab = gen_server:call(Pid, get_workers, infinity),
+          {ok, #{client => ClientId,
+                 topic => Topic,
+                 workers => WorkersTab,
+                 partitioner => maps:get(partitioner, ProducerOpts, roundrobin)
+                }};
+      {error, Reason} ->
+          {error, Reason}
+  end.
 
 stop_supervised(#{client := ClientId, workers := WorkersTab}) ->
   rocketmq_producers_sup:ensure_absence(ClientId, WorkersTab).
+
+%% Check that producers for Topic could be started now, without
+%% starting any: Topic has a route, or the broker auto-creates topics
+%% (the default topic has a route). Meant for periodic health checks.
+-spec check_topic(clientid(), topic()) -> ok | {error, term()}.
+check_topic(ClientId, Topic) ->
+    case rocketmq_client_sup:find_client(ClientId) of
+        {ok, Pid} ->
+            case find_route(Pid, Topic) of
+                {ok, _RouteInfo} -> ok;
+                {error, Reason} -> {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 -spec pick_producer(producers()) -> {index(), pid()}.
 pick_producer(Producers) ->
@@ -330,32 +358,60 @@ terminate(_, _St) -> ok.
 get_name(ProducerOpts) -> maps:get(name, ProducerOpts, ?MODULE).
 
 maybe_start_producer(Pid, State = #state{topic = Topic}) ->
-    case rocketmq_client:get_routeinfo_by_topic(Pid, Topic) of
-        {ok, {_Header, undefined}} ->
-            %% Try again using the default topic, as the 'Topic' does not exists for now.
-            %% Note that the topic will be created by the rocketmq server automatically
-            %% at first time we send message to it, if the user has configured
-            %% `autoCreateTopicEnable = true` in the rocketmq server side.
-            maybe_start_producer_using_default_topic(Pid, State);
-        {ok, {_, RouteInfo}} ->
+    case find_route(Pid, Topic) of
+        {ok, RouteInfo} ->
             start_producer_with_route_info(RouteInfo, State);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Find the route for Topic. When the name server answers TOPIC_NOT_EXIST, fall back to
+%% the route of the auto-create default topic: the broker then creates Topic at the first
+%% send when `autoCreateTopicEnable = true'. When that answer is TOPIC_NOT_EXIST too, the
+%% topic does not exist and the broker does not auto-create topics; the error carries the
+%% name server's own remark, which names the default topic. Any other error code
+%% (SYSTEM_BUSY, NO_PERMISSION, ...) is reported as is and never mistaken for a missing
+%% topic.
+find_route(Pid, Topic) ->
+    case rocketmq_client:get_routeinfo_by_topic(Pid, Topic) of
+        {ok, {_Header, RouteInfo}} when RouteInfo =/= undefined ->
+            {ok, RouteInfo};
+        {ok, {Header, undefined}} ->
+            case response_code(Header) of
+                ?RESPONSE_TOPIC_NOT_EXIST -> find_default_topic_route(Pid, Topic);
+                Code -> route_lookup_failed(Topic, Code, Header)
+            end;
         {error, Reason} ->
             logger:error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, Topic]),
             {error, {get_routeinfo_by_topic_failed, Reason}}
     end.
 
-maybe_start_producer_using_default_topic(Pid, State) ->
+find_default_topic_route(Pid, Topic) ->
     case rocketmq_client:get_routeinfo_by_topic(Pid, ?DEFAULT_TOPIC) of
+        {ok, {_Header, RouteInfo}} when RouteInfo =/= undefined ->
+            {ok, RouteInfo};
         {ok, {Header, undefined}} ->
-            logger:error("Start producer failed, remark: ~p",
-                [maps:get(<<"remark">>, Header, undefined)]),
-            {error, {start_producer_failed, Header}};
-        {ok, {_, RouteInfo}} ->
-            start_producer_with_route_info(RouteInfo, State);
+            case response_code(Header) of
+                ?RESPONSE_TOPIC_NOT_EXIST ->
+                    Remark = remark(Header),
+                    logger:error("Start producer failed, topic: ~p, remark: ~p", [Topic, Remark]),
+                    {error, {topic_not_found, #{topic => Topic, remark => Remark}}};
+                Code ->
+                    route_lookup_failed(?DEFAULT_TOPIC, Code, Header)
+            end;
         {error, Reason} ->
             logger:error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, ?DEFAULT_TOPIC]),
             {error, {get_routeinfo_by_topic_failed, Reason}}
     end.
+
+route_lookup_failed(Topic, Code, Header) ->
+    Remark = remark(Header),
+    logger:error("Get routeinfo by topic failed, topic: ~p, code: ~p, remark: ~p", [Topic, Code, Remark]),
+    {error, {route_lookup_failed, #{topic => Topic, code => Code, remark => Remark}}}.
+
+response_code(Header) -> maps:get(<<"code">>, Header, undefined).
+
+remark(Header) -> maps:get(<<"remark">>, Header, undefined).
 
 find_queue_data(_Key, []) ->
     [];
