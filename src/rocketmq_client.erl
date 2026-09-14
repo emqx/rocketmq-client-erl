@@ -100,11 +100,15 @@ get_status(Pid) ->
 %%
 %%   connected              -- socket is currently up
 %%   connecting             -- socket down, no failed retry yet
-%%                             (transient drop or first attempt in flight)
+%%                             (first attempt in flight)
 %%   {disconnected, Reason} -- one or more failed attempts since last
 %%                             success; Reason is the last connect /
 %%                             socket close error (e.g. econnrefused,
 %%                             tcp_closed, {tls_alert, ...}).
+%%
+%% A socket closed by the peer is reconnected inline (see
+%% reconnect_after_drop/2), so a passive close alone never shows up here:
+%% the next poll sees either `connected' or `{disconnected, Reason}'.
 -spec get_connection_state(pid() | atom()) ->
     connected
     | connecting
@@ -187,11 +191,10 @@ handle_call(get_status, _From, State) ->
 
 handle_call(get_connection_state, _From, State = #state{sock = undefined,
                                                         reconnect_attempts = 0}) ->
-    %% Socket is down but no failed retry yet (either a transient drop
-    %% that hasn't been retried, or init hasn't run handle_continue yet).
-    %% Report `connecting' so a brief blip doesn't flip the status; still
-    %% kick off a reconnect so we don't rely on the producer's slower
-    %% route-refresh cadence to recover.
+    %% Socket is down but no connect attempt has failed yet. A passive
+    %% close is reconnected inline (reconnect_after_drop/2), so this is
+    %% only reachable while the first connect is still in flight. Report
+    %% `connecting' and kick off a reconnect so the poll drives recovery.
     {reply, connecting, kick_async_reconnect(State)};
 handle_call(get_connection_state, _From, State = #state{sock = undefined,
                                                         last_error = LastError}) ->
@@ -220,15 +223,15 @@ handle_info({ssl, Sock, Bin}, #state{sock = Sock} = State) ->
     handle_response(Bin, State);
 
 handle_info({tcp_closed, Sock}, State = #state{sock = Sock}) ->
-    {noreply, record_socket_drop(tcp_closed, State), hibernate};
+    {noreply, reconnect_after_drop(tcp_closed, State), hibernate};
 
 handle_info({ssl_closed, Sock}, State = #state{sock = Sock}) ->
-    {noreply, record_socket_drop(ssl_closed, State), hibernate};
+    {noreply, reconnect_after_drop(ssl_closed, State), hibernate};
 
 handle_info({ssl_error, Sock, Reason}, State = #state{sock = Sock}) ->
     _ = ssl:close(Sock),
     log(error, "RocketMQ client Received SSL socket error: ~p~n", [Reason]),
-    {noreply, record_socket_drop({ssl_error, Reason}, State), hibernate};
+    {noreply, reconnect_after_drop({ssl_error, Reason}, State), hibernate};
 
 handle_info(try_reconnect, State = #state{sock = undefined}) ->
     {noreply, do_connect(State#state{reconnecting = false}), hibernate};
@@ -300,6 +303,16 @@ record_socket_drop(Reason, State) ->
     %% so get_connection_state can surface it if the next reconnect
     %% also fails.
     State#state{sock = undefined, last_error = Reason}.
+
+%% The name server closes a connection that carried no request for
+%% serverChannelMaxIdleTimeSeconds (120 s by default). This client only
+%% sends route requests on behalf of producers, so with no producer
+%% running every idle period ends with a passive close. Reconnect right
+%% away: a health check that follows then sees `connected' again, or
+%% `{disconnected, Reason}' when the server is really gone, instead of a
+%% one-poll `connecting' blip that raises and clears an alarm.
+reconnect_after_drop(Reason, State) ->
+    do_connect(record_socket_drop(Reason, State)).
 
 kick_async_reconnect(State = #state{reconnecting = true}) ->
     State;
