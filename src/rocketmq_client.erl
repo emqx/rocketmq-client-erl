@@ -54,9 +54,8 @@
     %% connect. `undefined' when the socket is healthy or has never
     %% failed. Cleared on successful connect.
     last_error = undefined,
-    %% True while an async try_reconnect is in flight, to avoid
-    %% queueing multiple reconnect attempts when health checks arrive
-    %% faster than a connect attempt can complete.
+    %% True while a connect worker is in flight (see start_connect/1),
+    %% so polls and drops do not start a second attempt.
     reconnecting = false,
     %% Opt-in free-form field reserved for hot upgrades so the record
     %% layout can be frozen across versions without appending new
@@ -74,8 +73,9 @@
     {packet,    raw},
     {reuseaddr, true},
     {nodelay,   true},
-    {active,    true},
-    {reuseaddr, true},
+    %% Passive until the socket is owned by the client process
+    %% (see activate/2); a connect worker must not receive data.
+    {active,    false},
     {send_timeout,  ?TIMEOUT}]).
 
 start_link(ClientId, Servers, Opts) ->
@@ -95,20 +95,23 @@ get_status(Pid) ->
     gen_server:call(Pid, get_status, 5000).
 
 %% Reports connection state without blocking on a connect attempt, and
-%% kicks off an async reconnect when the socket is down so every poll
-%% from the host application drives recovery.
+%% starts a connect worker when the socket is down so every poll from
+%% the host application drives recovery.
 %%
 %%   connected              -- socket is currently up
-%%   connecting             -- socket down, no failed retry yet
-%%                             (first attempt in flight)
+%%   connecting             -- socket down, a connect attempt is in
+%%                             flight and none has failed since the last
+%%                             success (first connect, or the reconnect
+%%                             that follows a passive close)
 %%   {disconnected, Reason} -- one or more failed attempts since last
 %%                             success; Reason is the last connect /
 %%                             socket close error (e.g. econnrefused,
 %%                             tcp_closed, {tls_alert, ...}).
 %%
-%% A socket closed by the peer is reconnected inline (see
-%% reconnect_after_drop/2), so a passive close alone never shows up here:
-%% the next poll sees either `connected' or `{disconnected, Reason}'.
+%% A socket closed by the peer starts a reconnect at once, in a worker
+%% process, so the client keeps answering while a slow TCP connect or
+%% TLS handshake is under way. In the common case the socket is back
+%% before the next poll and the poll sees `connected'.
 -spec get_connection_state(pid() | atom()) ->
     connected
     | connecting
@@ -151,7 +154,7 @@ init([Servers, Opts]) ->
     {ok, State, {continue, connect}}.
 
 handle_continue(connect, State) ->
-    {noreply, do_connect(State)};
+    {noreply, start_connect(State)};
 handle_continue(_, State) ->
     {noreply, State}.
 
@@ -164,9 +167,11 @@ handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = Op
                                                                   }) ->
     case get_sock(Servers, Sock, Opts) of
         {error, Reason} ->
+            %% Reply instead of leaving the caller to its 15 s timeout.
             log(error, "Servers: ~p down, reason: ~p", [Servers, Reason]),
-            {noreply, record_connect_failure(Reason, State)};
+            {reply, {error, Reason}, record_connect_failure(Reason, State)};
         {ok, Sock1} ->
+            ok = activate(Sock1, SockSendMod),
             ACLInfo = maps:get(acl_info, Opts, #{}),
             Namespace = maps:get(namespace, Opts, <<>>),
             Package = rocketmq_protocol_frame:get_routeinfo_by_topic(OpaqueId, Namespace, Topic, ACLInfo),
@@ -179,11 +184,13 @@ handle_call({get_routeinfo_by_topic, Topic}, From, State = #state{opaque_id = Op
 
 handle_call(get_status, _From, State = #state{sock = undefined,
                                               servers = Servers,
-                                              opts = Opts}) ->
+                                              opts = Opts,
+                                              sock_mod = SockSendMod}) ->
     case get_sock(Servers, undefined, Opts) of
         {error, Reason} ->
             {reply, false, record_connect_failure(Reason, State)};
         {ok, Sock} ->
+            ok = activate(Sock, SockSendMod),
             {reply, true, record_connect_success(State#state{sock = Sock})}
     end;
 handle_call(get_status, _From, State) ->
@@ -191,11 +198,11 @@ handle_call(get_status, _From, State) ->
 
 handle_call(get_connection_state, _From, State = #state{sock = undefined,
                                                         reconnect_attempts = 0}) ->
-    %% Socket is down but no connect attempt has failed yet. A passive
-    %% close is reconnected inline (reconnect_after_drop/2), so this is
-    %% only reachable while the first connect is still in flight. Report
-    %% `connecting' and kick off a reconnect so the poll drives recovery.
-    {reply, connecting, kick_async_reconnect(State)};
+    %% Socket is down and no connect attempt has failed since the last
+    %% success: the first connect or the reconnect after a passive close
+    %% is in flight. Report `connecting'; start_connect/1 is a no-op
+    %% while a worker runs.
+    {reply, connecting, start_connect(State)};
 handle_call(get_connection_state, _From, State = #state{sock = undefined,
                                                         last_error = LastError}) ->
     %% One or more failed connect attempts since the last success --
@@ -205,7 +212,7 @@ handle_call(get_connection_state, _From, State = #state{sock = undefined,
     %% than appearing to be 'still trying'. Keep attempting in the
     %% background so recovery happens automatically once the broker is
     %% reachable again.
-    {reply, {disconnected, LastError}, kick_async_reconnect(State)};
+    {reply, {disconnected, LastError}, start_connect(State)};
 handle_call(get_connection_state, _From, State) ->
     %% sock =/= undefined -- either a gen_tcp port or an ssl socket tuple
     {reply, connected, State};
@@ -233,10 +240,25 @@ handle_info({ssl_error, Sock, Reason}, State = #state{sock = Sock}) ->
     log(error, "RocketMQ client Received SSL socket error: ~p~n", [Reason]),
     {noreply, reconnect_after_drop({ssl_error, Reason}, State), hibernate};
 
-handle_info(try_reconnect, State = #state{sock = undefined}) ->
-    {noreply, do_connect(State#state{reconnecting = false}), hibernate};
-handle_info(try_reconnect, State) ->
-    {noreply, State#state{reconnecting = false}, hibernate};
+handle_info({connect_result, Worker, Result}, State = #state{extra = Extra}) ->
+    case maps:get(connect_worker, Extra, undefined) of
+        {Worker, Ref} ->
+            erlang:demonitor(Ref, [flush]),
+            State1 = State#state{reconnecting = false, extra = maps:remove(connect_worker, Extra)},
+            {noreply, connect_result(Result, State1), hibernate};
+        _ ->
+            %% A stale worker (its socket, if any, was closed by the worker).
+            {noreply, State, hibernate}
+    end;
+
+handle_info({'DOWN', Ref, process, Worker, Reason}, State = #state{extra = Extra}) ->
+    case maps:get(connect_worker, Extra, undefined) of
+        {Worker, Ref} ->
+            State1 = State#state{reconnecting = false, extra = maps:remove(connect_worker, Extra)},
+            {noreply, record_connect_failure({connect_worker_down, Reason}, State1), hibernate};
+        _ ->
+            {noreply, State, hibernate}
+    end;
 
 handle_info(_Info, State) ->
     log(error, "RocketMQ client Receive unknown message:~p~n", [_Info]),
@@ -276,20 +298,50 @@ tune_buffer(Sock) ->
         = inet:getopts(Sock, [recbuf, sndbuf]),
     inet:setopts(Sock, [{buffer, max(RecBuf, SndBuf)}]).
 
-%% Attempt a connect once, updating state accordingly. The caller
-%% decides whether that was driven by init (handle_continue) or a
-%% kick_async_reconnect (handle_info).
-do_connect(State = #state{sock = undefined,
-                          servers = Servers,
-                          opts = Opts}) ->
-    case get_sock(Servers, undefined, Opts) of
-        {error, Reason} ->
-            record_connect_failure(Reason, State);
-        {ok, Sock} ->
-            record_connect_success(State#state{sock = Sock})
-    end;
-do_connect(State) ->
+%% Start a connect attempt in a worker process, unless one is in flight.
+%% The worker connects (TCP, then TLS when configured) with the socket in
+%% passive mode, hands the socket to the client and reports the result as
+%% {connect_result, WorkerPid, {ok, Sock} | {error, Reason}}. The client
+%% keeps serving calls meanwhile, so a slow connect or a stalled TLS
+%% handshake never blocks a status poll or a route request.
+start_connect(State = #state{reconnecting = true}) ->
+    State;
+start_connect(State = #state{sock = undefined, servers = Servers, opts = Opts,
+                             sock_mod = SockMod, extra = Extra}) ->
+    Client = self(),
+    {Worker, Ref} = spawn_monitor(fun() -> connect_worker(Client, Servers, Opts, SockMod) end),
+    State#state{reconnecting = true, extra = Extra#{connect_worker => {Worker, Ref}}};
+start_connect(State) ->
     State.
+
+connect_worker(Client, Servers, Opts, SockMod) ->
+    Result =
+        case get_sock(Servers, undefined, Opts) of
+            {ok, Sock} ->
+                case SockMod:controlling_process(Sock, Client) of
+                    ok -> {ok, Sock};
+                    {error, Reason} -> _ = SockMod:close(Sock), {error, {controlling_process, Reason}}
+                end;
+            {error, _} = Error ->
+                Error
+        end,
+    Client ! {connect_result, self(), Result},
+    ok.
+
+connect_result({ok, Sock}, State = #state{sock = undefined, sock_mod = SockMod}) ->
+    ok = activate(Sock, SockMod),
+    record_connect_success(State#state{sock = Sock});
+connect_result({ok, Sock}, State = #state{sock_mod = SockMod}) ->
+    %% A synchronous connect (route request) won the race; keep that one.
+    _ = SockMod:close(Sock),
+    State;
+connect_result({error, Reason}, State) ->
+    record_connect_failure(Reason, State).
+
+%% The socket is passive while it changes owner; make it active once the
+%% client process owns it.
+activate(Sock, gen_tcp) -> inet:setopts(Sock, [{active, true}]);
+activate(Sock, ssl) -> ssl:setopts(Sock, [{active, true}]).
 
 record_connect_success(State) ->
     State#state{reconnect_attempts = 0, last_error = undefined}.
@@ -312,13 +364,7 @@ record_socket_drop(Reason, State) ->
 %% `{disconnected, Reason}' when the server is really gone, instead of a
 %% one-poll `connecting' blip that raises and clears an alarm.
 reconnect_after_drop(Reason, State) ->
-    do_connect(record_socket_drop(Reason, State)).
-
-kick_async_reconnect(State = #state{reconnecting = true}) ->
-    State;
-kick_async_reconnect(State) ->
-    self() ! try_reconnect,
-    State#state{reconnecting = true}.
+    start_connect(record_socket_drop(Reason, State)).
 
 get_sock(Servers, undefined, Opts) ->
     SSLOpts = maps:get(ssl_opts, Opts, undefined),
@@ -333,7 +379,6 @@ try_connect([{Host, Port} | Servers], SSLOpts, ConnectTimeout, _PrevError) ->
     case gen_tcp:connect(Host, Port, ?TCPOPTIONS, ConnectTimeout) of
         {ok, Sock} ->
             tune_buffer(Sock),
-            gen_tcp:controlling_process(Sock, self()),
             case maybe_upgrade_tls(Sock, SSLOpts, ConnectTimeout) of
                 {error, TLSConnectErrorReason} ->
                     log(warning, "Could not establish TLS connection ~p:~p, Reason: ~p",
