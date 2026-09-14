@@ -31,6 +31,7 @@
 
 -export([ start_supervised/4
         , stop_supervised/1
+        , check_topic/2
         ]).
 
 -export([ pick_producer/1
@@ -104,6 +105,21 @@ start_supervised(ClientId, ProducerGroup, Topic, ProducerOpts) ->
 
 stop_supervised(#{client := ClientId, workers := WorkersTab}) ->
   rocketmq_producers_sup:ensure_absence(ClientId, WorkersTab).
+
+%% Check that producers for Topic could be started now, without
+%% starting any: Topic has a route, or the broker auto-creates topics
+%% (the default topic has a route). Meant for periodic health checks.
+-spec check_topic(clientid(), topic()) -> ok | {error, term()}.
+check_topic(ClientId, Topic) ->
+    case rocketmq_client_sup:find_client(ClientId) of
+        {ok, Pid} ->
+            case find_route(Pid, Topic) of
+                {ok, _RouteInfo} -> ok;
+                {error, Reason} -> {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 -spec pick_producer(producers()) -> {index(), pid()}.
 pick_producer(Producers) ->
@@ -340,32 +356,38 @@ terminate(_, _St) -> ok.
 get_name(ProducerOpts) -> maps:get(name, ProducerOpts, ?MODULE).
 
 maybe_start_producer(Pid, State = #state{topic = Topic}) ->
+    case find_route(Pid, Topic) of
+        {ok, RouteInfo} ->
+            start_producer_with_route_info(RouteInfo, State);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Find the route for Topic, or the route of the auto-create default
+%% topic when Topic has none: the broker then creates Topic at the first
+%% send when `autoCreateTopicEnable = true`. When neither exists the
+%% topic does not exist and the broker does not auto-create topics; the
+%% error carries the name server's own remark, which names the default
+%% topic.
+find_route(Pid, Topic) ->
     case rocketmq_client:get_routeinfo_by_topic(Pid, Topic) of
         {ok, {_Header, undefined}} ->
-            %% Try again using the default topic, as the 'Topic' does not exists for now.
-            %% Note that the topic will be created by the rocketmq server automatically
-            %% at first time we send message to it, if the user has configured
-            %% `autoCreateTopicEnable = true` in the rocketmq server side.
-            maybe_start_producer_using_default_topic(Pid, State);
+            find_default_topic_route(Pid, Topic);
         {ok, {_, RouteInfo}} ->
-            start_producer_with_route_info(RouteInfo, State);
+            {ok, RouteInfo};
         {error, Reason} ->
             logger:error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, Topic]),
             {error, {get_routeinfo_by_topic_failed, Reason}}
     end.
 
-maybe_start_producer_using_default_topic(Pid, State = #state{topic = Topic}) ->
+find_default_topic_route(Pid, Topic) ->
     case rocketmq_client:get_routeinfo_by_topic(Pid, ?DEFAULT_TOPIC) of
         {ok, {Header, undefined}} ->
-            %% Neither the topic nor the auto-create default topic has a
-            %% route: the topic does not exist and the broker does not
-            %% auto-create topics. The remark is the name server's own
-            %% explanation, and it names the default topic.
             Remark = maps:get(<<"remark">>, Header, undefined),
             logger:error("Start producer failed, topic: ~p, remark: ~p", [Topic, Remark]),
             {error, {topic_not_found, #{topic => Topic, remark => Remark}}};
         {ok, {_, RouteInfo}} ->
-            start_producer_with_route_info(RouteInfo, State);
+            {ok, RouteInfo};
         {error, Reason} ->
             logger:error("Get routeinfo by topic failed: ~p, topic: ~p", [Reason, ?DEFAULT_TOPIC]),
             {error, {get_routeinfo_by_topic_failed, Reason}}

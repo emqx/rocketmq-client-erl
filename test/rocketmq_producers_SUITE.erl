@@ -17,14 +17,16 @@
 
 -export([t_topic_not_found_returns_error/1,
          t_topic_not_found_is_retried_fresh/1,
-         t_default_topic_lookup_is_not_namespaced/1]).
+         t_default_topic_lookup_is_not_namespaced/1,
+         t_check_topic_reports_topic_not_found/1]).
 
 -define(TOPIC_NOT_EXIST, 17).
 
 all() ->
     [t_topic_not_found_returns_error,
      t_topic_not_found_is_retried_fresh,
-     t_default_topic_lookup_is_not_namespaced].
+     t_default_topic_lookup_is_not_namespaced,
+     t_check_topic_reports_topic_not_found].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(rocketmq),
@@ -77,6 +79,17 @@ t_default_topic_lookup_is_not_namespaced(Config) ->
           ClientId, <<"group1">>, <<"t1">>, producer_opts(?FUNCTION_NAME)),
     ?assertEqual([<<"ns1%t1">>, ?DEFAULT_TOPIC],
                  requested_topics(?config(fake_namesrv, Config))),
+    ok.
+
+%% check_topic/2 runs the same lookup as a producer start, without
+%% starting anything.
+t_check_topic_reports_topic_not_found(Config) ->
+    ClientId = ?config(client_id, Config),
+    ?assertMatch({error, {topic_not_found, #{topic := <<"t1">>, remark := <<_/binary>>}}},
+                 rocketmq:check_topic(ClientId, <<"t1">>)),
+    ?assertEqual([<<"ns1%t1">>, ?DEFAULT_TOPIC],
+                 requested_topics(?config(fake_namesrv, Config))),
+    ?assertEqual([], supervisor:which_children(rocketmq_producers_sup)),
     ok.
 
 %%--------------------------------------------------------------------
