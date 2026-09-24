@@ -17,6 +17,7 @@
 
 -export([t_connect_refused_reports_disconnected_with_reason/1,
          t_connect_success_reports_connected/1,
+         t_first_poll_after_start_sees_connected/1,
          t_socket_drop_reconnects_inline/1,
          t_connect_in_flight_does_not_block_status/1,
          t_socket_drop_with_server_gone_reports_disconnected/1,
@@ -28,6 +29,7 @@
 all() ->
     [t_connect_refused_reports_disconnected_with_reason,
      t_connect_success_reports_connected,
+     t_first_poll_after_start_sees_connected,
      t_socket_drop_reconnects_inline,
      t_connect_in_flight_does_not_block_status,
      t_socket_drop_with_server_gone_reports_disconnected,
@@ -62,15 +64,8 @@ t_connect_refused_reports_disconnected_with_reason(Config) ->
     Port = free_port(),
     {ok, Pid} = start_client(?config(client_id, Config),
                              [{"127.0.0.1", Port}], #{}),
-    %% The first attempt runs in a connect worker started from
-    %% handle_continue; it fails within milliseconds on loopback and
-    %% bumps reconnect_attempts.
-    ok = wait_for(fun() ->
-                          case rocketmq_client:get_connection_state(Pid) of
-                              {disconnected, _} -> true;
-                              _ -> false
-                          end
-                  end, 2000),
+    %% The first attempt runs in the client process, so it has already
+    %% failed by the time the first poll is answered.
     ?assertMatch({disconnected, {tcp_connect_error, {_, _, econnrefused}}},
                  rocketmq_client:get_connection_state(Pid)),
     ok.
@@ -80,6 +75,19 @@ t_connect_success_reports_connected(Config) ->
     {ok, Pid} = start_client(?config(client_id, Config),
                              [{"127.0.0.1", Port}], #{}),
     ok = wait_for(fun() -> rocketmq_client:get_connection_state(Pid) =:= connected end, 2000),
+    ?assertEqual(connected, rocketmq_client:get_connection_state(Pid)),
+    stop_listener(Listener),
+    ok.
+
+t_first_poll_after_start_sees_connected(Config) ->
+    %% Regression guard: the very first status poll after the client
+    %% starts must report `connected', with no polling loop. A host
+    %% application health-checks the client as soon as it has started it;
+    %% a `connecting' answer there makes it raise a resource-down alarm
+    %% and wait a whole health-check interval before it looks again.
+    {ok, Listener, Port} = start_listener(),
+    {ok, Pid} = start_client(?config(client_id, Config),
+                             [{"127.0.0.1", Port}], #{}),
     ?assertEqual(connected, rocketmq_client:get_connection_state(Pid)),
     stop_listener(Listener),
     ok.
@@ -105,25 +113,21 @@ t_socket_drop_reconnects_inline(Config) ->
 
 t_connect_in_flight_does_not_block_status(Config) ->
     %% A listener that accepts TCP but never answers the TLS handshake:
-    %% the connect attempt stalls until connect_timeout. The client must
-    %% keep answering status calls meanwhile, since the attempt runs in
-    %% a worker, not in the client's own mailbox loop.
+    %% every connect attempt stalls until connect_timeout. Retries run in
+    %% a worker, not in the client's own mailbox loop, so the client keeps
+    %% answering status calls while one is in flight.
     {ok, Listener, Port} = start_listener(),
     {ok, Pid} = start_client(?config(client_id, Config), [{"127.0.0.1", Port}],
                              #{ssl_opts => [{verify, verify_none}], connect_timeout => 3000}),
+    %% The first attempt runs in the client process; this poll is answered
+    %% once it has timed out, and starts a worker for the retry.
+    ?assertMatch({disconnected, {tls_connect_error, _}},
+                 rocketmq_client:get_connection_state(Pid)),
     T0 = erlang:monotonic_time(millisecond),
-    State = rocketmq_client:get_connection_state(Pid),
+    States = [rocketmq_client:get_connection_state(Pid) || _ <- lists:seq(1, 5)],
     Elapsed = erlang:monotonic_time(millisecond) - T0,
-    ?assertEqual(connecting, State),
-    ?assert(Elapsed < 1000, {status_call_blocked_ms, Elapsed}),
-    %% The stalled handshake times out and is reported as a failure.
-    ok = wait_for(
-           fun() ->
-                   case rocketmq_client:get_connection_state(Pid) of
-                       {disconnected, {tls_connect_error, _}} -> true;
-                       _ -> false
-                   end
-           end, 6000),
+    ?assert(Elapsed < 1000, {status_calls_blocked_ms, Elapsed}),
+    [?assertMatch({disconnected, {tls_connect_error, _}}, S) || S <- States],
     stop_listener(Listener),
     ok.
 

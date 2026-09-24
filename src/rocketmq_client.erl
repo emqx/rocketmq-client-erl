@@ -99,14 +99,16 @@ get_status(Pid) ->
 %% the host application drives recovery.
 %%
 %%   connected              -- socket is currently up
-%%   connecting             -- socket down, a connect attempt is in
-%%                             flight and none has failed since the last
-%%                             success (first connect, or the reconnect
-%%                             that follows a passive close)
+%%   connecting             -- socket down, a reconnect is in flight and
+%%                             none has failed since the last success
 %%   {disconnected, Reason} -- one or more failed attempts since last
 %%                             success; Reason is the last connect /
 %%                             socket close error (e.g. econnrefused,
 %%                             tcp_closed, {tls_alert, ...}).
+%%
+%% The first poll after the client starts never sees `connecting': the
+%% first connect runs in the client process (see first_connect/1), so
+%% this call is answered once that attempt has finished.
 %%
 %% A socket closed by the peer starts a reconnect at once, in a worker
 %% process, so the client keeps answering while a slow TCP connect or
@@ -141,8 +143,8 @@ init([Servers, Opts]) ->
     %% Do not perform the initial TCP/TLS connect in init/1.
     %% The supervisor is blocked while init runs, so a slow/unreachable
     %% server would stall every other rocketmq client sharing the
-    %% singleton rocketmq_client_sup. Kick off the connect asynchronously
-    %% via handle_continue/2 instead; sock stays undefined until ready.
+    %% singleton rocketmq_client_sup. Connect from handle_continue/2
+    %% instead, which runs once init/1 has returned.
     State = #state{
         servers = Servers,
         opts = Opts,
@@ -154,7 +156,7 @@ init([Servers, Opts]) ->
     {ok, State, {continue, connect}}.
 
 handle_continue(connect, State) ->
-    {noreply, start_connect(State)};
+    {noreply, first_connect(State)};
 handle_continue(_, State) ->
     {noreply, State}.
 
@@ -298,7 +300,25 @@ tune_buffer(Sock) ->
         = inet:getopts(Sock, [recbuf, sndbuf]),
     inet:setopts(Sock, [{buffer, max(RecBuf, SndBuf)}]).
 
+%% The first connect runs in the client process, before any message is
+%% handled, so the first get_connection_state/1 poll after the client
+%% starts reports the outcome of that attempt and never `connecting'.
+%% init/1 has already returned, so the supervisor is not blocked. Every
+%% later attempt runs in a worker (see start_connect/1).
+first_connect(State = #state{sock = undefined, servers = Servers, opts = Opts,
+                             sock_mod = SockMod}) ->
+    case get_sock(Servers, undefined, Opts) of
+        {ok, Sock} ->
+            ok = activate(Sock, SockMod),
+            record_connect_success(State#state{sock = Sock});
+        {error, Reason} ->
+            record_connect_failure(Reason, State)
+    end;
+first_connect(State) ->
+    State.
+
 %% Start a connect attempt in a worker process, unless one is in flight.
+%% Every caller holds a state whose socket is down.
 %% The worker connects (TCP, then TLS when configured) with the socket in
 %% passive mode, hands the socket to the client and reports the result as
 %% {connect_result, WorkerPid, {ok, Sock} | {error, Reason}}. The client
@@ -310,9 +330,7 @@ start_connect(State = #state{sock = undefined, servers = Servers, opts = Opts,
                              sock_mod = SockMod, extra = Extra}) ->
     Client = self(),
     {Worker, Ref} = spawn_monitor(fun() -> connect_worker(Client, Servers, Opts, SockMod) end),
-    State#state{reconnecting = true, extra = Extra#{connect_worker => {Worker, Ref}}};
-start_connect(State) ->
-    State.
+    State#state{reconnecting = true, extra = Extra#{connect_worker => {Worker, Ref}}}.
 
 connect_worker(Client, Servers, Opts, SockMod) ->
     Result =
